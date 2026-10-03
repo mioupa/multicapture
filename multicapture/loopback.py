@@ -1,5 +1,6 @@
 import ctypes
 import threading
+import time
 from ctypes import wintypes
 
 from .win32 import (
@@ -21,6 +22,7 @@ AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
 AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM = 0x80000000
 AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY = 0x08000000
 AUDCLNT_BUFFERFLAGS_SILENT = 0x2
+AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR = 0x4
 WAVE_FORMAT_PCM = 1
 E_NOINTERFACE = -2147467262
 
@@ -103,6 +105,7 @@ class ProcessLoopback:
         self.client = ctypes.c_void_p()
         self.capture = ctypes.c_void_p()
         self._handler = None
+        self._next_stamp = None
 
     def start(self, timeout=5.0):
         ensure_mta()
@@ -148,7 +151,7 @@ class ProcessLoopback:
         self._next_packet = method(self.capture, 5, HRESULT, ctypes.POINTER(ctypes.c_uint32))
         check(method(self.client, 10, HRESULT)(), "IAudioClient.Start")
 
-    def read(self):
+    def read_timed(self):
         chunks = []
         size = ctypes.c_uint32()
         if self._next_packet(ctypes.byref(size)) < 0:
@@ -157,17 +160,29 @@ class ProcessLoopback:
             data = ctypes.c_void_p()
             frames = ctypes.c_uint32()
             flags = wintypes.DWORD()
-            if self._get_buffer(ctypes.byref(data), ctypes.byref(frames), ctypes.byref(flags), None, None) < 0:
+            qpc = ctypes.c_uint64()
+            if self._get_buffer(ctypes.byref(data), ctypes.byref(frames), ctypes.byref(flags), None, ctypes.byref(qpc)) < 0:
                 raise OSError("audio capture lost")
             n = frames.value * self.block_align
             if flags.value & AUDCLNT_BUFFERFLAGS_SILENT or not data.value:
-                chunks.append(bytes(n))
+                payload = bytes(n)
             else:
-                chunks.append(ctypes.string_at(data, n))
+                payload = ctypes.string_at(data, n)
             self._release_buffer(frames)
+            if flags.value & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR or not qpc.value:
+                stamp = None
+            else:
+                stamp = qpc.value * 1e-7
+            if stamp is None or abs(stamp - time.perf_counter()) > 5.0:
+                stamp = self._next_stamp if self._next_stamp is not None else time.perf_counter() - frames.value / self.sample_rate
+            self._next_stamp = stamp + frames.value / self.sample_rate
+            chunks.append((payload, stamp))
             if self._next_packet(ctypes.byref(size)) < 0:
                 break
-        return b"".join(chunks)
+        return chunks
+
+    def read(self):
+        return b"".join(payload for payload, _ in self.read_timed())
 
     def close(self):
         if self.client.value:

@@ -3,6 +3,8 @@ import time
 
 from .cdp import CDPError
 
+STATE_RETRIES = 4
+
 FIND_JS = r"""
 (() => {
   const found = [];
@@ -83,7 +85,9 @@ PLAY_JS = r"""
   const mc = window.__mc;
   if (!mc) return 'no player';
   mc.videos.forEach(v => { v.muted = false; v.playbackRate = 1; });
-  const results = await Promise.all(mc.videos.map(v => v.play().then(() => 'ok').catch(e => String(e))));
+  const all = Promise.all(mc.videos.map(v => v.play().then(() => 'ok').catch(e => String(e))));
+  const results = await Promise.race([all, new Promise(r => setTimeout(() => r(null), 3000))]);
+  if (!results) return 'pending';
   return results[mc.videos.indexOf(mc.main)] || 'ok';
 })()
 """
@@ -203,7 +207,14 @@ class Player:
         raise CDPError("ページ内に動画が見つかりませんでした（ログインが必要か、再生ボタンを押す必要があるかもしれません）")
 
     def state(self):
-        return self.browser.evaluate(self.session, STATE_JS, timeout=10) or {"ok": False}
+        last_error = None
+        for _ in range(STATE_RETRIES):
+            try:
+                return self.browser.evaluate(self.session, STATE_JS, timeout=10) or {"ok": False}
+            except CDPError as exc:
+                last_error = exc
+                time.sleep(0.5)
+        raise last_error
 
     def seek(self, t):
         return bool(self.browser.evaluate(self.session, f"({SEEK_JS})({float(t)!r})", timeout=60))

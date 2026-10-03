@@ -34,12 +34,10 @@ ERROR_PIPE_CONNECTED = 535
 SAMPLE_RATE = 48000
 CHANNELS = 2
 BLOCK_ALIGN = CHANNELS * 2
-AUDIO_MAX_LAG = 0.15
-AUDIO_TARGET_LAG = 0.04
-AUDIO_MAX_LEAD = 0.1
 AUDIO_QUEUE_CHUNKS = 3000
 AUDIO_TAIL_SECONDS = 0.3
 AUDIO_DELAY_SECONDS = 0.0
+AUDIO_MAX_GAP_SECONDS = 30.0
 POLL_INTERVAL = 0.004
 PHASE_SMOOTHING = 0.98
 PHASE_LOCK_THRESHOLD = 0.3
@@ -107,31 +105,63 @@ class SlotRecorder:
         self._thread = None
         self._clock_lock = threading.Lock()
         self._t0 = None
-        self._pause_total = 0.0
-        self._pause_started = None
+        self._pauses = []
+        self._pause_at = None
+
+    def _timeline_at(self, wall):
+        total = wall - self._t0
+        for start, end in self._pauses:
+            if start >= wall:
+                continue
+            total -= min(wall if end is None else end, wall) - start
+        return total
 
     def elapsed(self):
         with self._clock_lock:
             if self._t0 is None:
                 return 0.0
-            now = time.perf_counter()
-            paused = (now - self._pause_started) if self._pause_started is not None else 0.0
-            return now - self._t0 - self._pause_total - paused
+            return self._timeline_at(time.perf_counter())
+
+    def position_of(self, wall):
+        with self._clock_lock:
+            if self._t0 is None or wall < self._t0:
+                return None, None
+            for start, end in self._pauses:
+                if start <= wall and (end is None or wall < end):
+                    return None, end
+            return self._timeline_at(wall), None
+
+    def pause_started_after(self, wall):
+        with self._clock_lock:
+            for start, end in self._pauses:
+                if start > wall:
+                    return start
+            return None
 
     @property
     def paused(self):
-        return self._pause_started is not None
+        return bool(self._pauses) and self._pauses[-1][1] is None
 
     def pause(self):
         with self._clock_lock:
-            if self._pause_started is None:
-                self._pause_started = time.perf_counter()
+            if not (self._pauses and self._pauses[-1][1] is None):
+                self._pauses.append([time.perf_counter(), None])
+
+    def _pause_snapped(self, timeline):
+        with self._clock_lock:
+            if self._t0 is None or (self._pauses and self._pauses[-1][1] is None):
+                return
+            now = time.perf_counter()
+            current = self._timeline_at(now)
+            self._pauses.append([now - max(0.0, current - timeline), None])
+
+    def pause_at_frame(self, frame_index):
+        self._pause_at = frame_index
 
     def resume(self):
         with self._clock_lock:
-            if self._pause_started is not None:
-                self._pause_total += time.perf_counter() - self._pause_started
-                self._pause_started = None
+            if self._pauses and self._pauses[-1][1] is None:
+                self._pauses[-1][1] = time.perf_counter()
 
     def status(self, text):
         self.on_status(self.index, text)
@@ -276,6 +306,12 @@ class SlotRecorder:
             for _ in range(max(0, behind)):
                 if self.stop_event.is_set():
                     break
+                if self.paused:
+                    break
+                if self._pause_at is not None and self.frames_written >= self._pause_at:
+                    self._pause_at = None
+                    self._pause_snapped(self.frames_written / fps)
+                    break
                 nominal = base + self.frames_written / fps
                 sample_time = nominal - ((nominal - target) % period) if locked else nominal
                 capture.write_to(write, sample_time)
@@ -307,34 +343,64 @@ class SlotRecorder:
         wt = threading.Thread(target=writer, daemon=True)
         wt.start()
         win32.ensure_mta()
-        loop.read()
-        delay = int(AUDIO_DELAY_SECONDS * SAMPLE_RATE)
-        q.put(bytes(delay * BLOCK_ALIGN))
-        written = delay
+        written = 0
+
+        def emit(data):
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass
+
+        def place(data, stamp):
+            nonlocal written
+            frames = len(data) // BLOCK_ALIGN
+            shift = AUDIO_DELAY_SECONDS
+            while frames > 0:
+                pos, resume_at = self.position_of(stamp + shift)
+                if pos is None:
+                    if resume_at is None:
+                        if self._t0 is not None and stamp + shift < self._t0:
+                            skip = min(frames, int((self._t0 - stamp - shift) * SAMPLE_RATE) + 1)
+                        else:
+                            return
+                    else:
+                        skip = min(frames, max(1, int(round((resume_at - stamp - shift) * SAMPLE_RATE))))
+                    data = data[skip * BLOCK_ALIGN:]
+                    frames -= skip
+                    stamp += skip / SAMPLE_RATE
+                    continue
+                cut = self.pause_started_after(stamp + shift)
+                keep = frames
+                if cut is not None:
+                    keep = max(0, min(frames, int(round((cut - stamp - shift) * SAMPLE_RATE))))
+                target = int(round(pos * SAMPLE_RATE))
+                head = data[:keep * BLOCK_ALIGN]
+                if target > written:
+                    gap = target - written
+                    if gap <= AUDIO_MAX_GAP_SECONDS * SAMPLE_RATE:
+                        emit(bytes(gap * BLOCK_ALIGN))
+                        written += gap
+                elif target < written:
+                    overlap = min(keep, written - target)
+                    head = head[overlap * BLOCK_ALIGN:]
+                if head:
+                    emit(head)
+                    written += len(head) // BLOCK_ALIGN
+                data = data[keep * BLOCK_ALIGN:]
+                frames -= keep
+                stamp += keep / SAMPLE_RATE
+                if keep == 0:
+                    pos2, _ = self.position_of(stamp + shift)
+                    if pos2 is not None:
+                        return
+
         try:
             while not self.stop_event.is_set():
-                data = loop.read()
-                if self.paused:
-                    time.sleep(0.01)
-                    continue
-                expected = int(self.elapsed() * SAMPLE_RATE)
-                frames = len(data) // BLOCK_ALIGN
-                if written + frames < expected - AUDIO_MAX_LAG * SAMPLE_RATE:
-                    pad = expected - int(AUDIO_TARGET_LAG * SAMPLE_RATE) - (written + frames)
-                    if pad > 0:
-                        data = bytes(pad * BLOCK_ALIGN) + data
-                        frames += pad
-                elif written + frames > expected + AUDIO_MAX_LEAD * SAMPLE_RATE:
-                    drop = min(frames, written + frames - expected)
-                    data = data[drop * BLOCK_ALIGN:]
-                    frames -= drop
-                if data:
-                    try:
-                        q.put_nowait(data)
-                    except queue.Full:
-                        pass
-                    written += frames
-                time.sleep(0.01)
+                for data, stamp in loop.read_timed():
+                    place(data, stamp)
+                time.sleep(0.005)
+            for data, stamp in loop.read_timed():
+                place(data, stamp)
         except OSError as exc:
             failure.append(exc)
         finally:

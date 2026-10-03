@@ -17,6 +17,10 @@ from .recorder import SlotRecorder
 WARMUP_SECONDS = 2.5
 STALL_SECONDS = 0.2
 POLL_SECONDS = 0.05
+BOUNDARY_POLL_SECONDS = 0.002
+PREROLL_SECONDS = 1.5
+BYTES_PER_SECOND_1080P = 1_000_000
+PLAY_OK = ("ok", "pending", None, True)
 PREBUFFER_SECONDS = 5.0
 RESUME_CONFIRM_SECONDS = 0.5
 SEEK_SETTLE_SECONDS = 0.3
@@ -196,6 +200,14 @@ class SplitJob:
             os.makedirs(self.output_dir, exist_ok=True)
             self.output_path = os.path.join(self.output_dir, f"{safe_name(title)}_{stamp}.mp4")
 
+            needed = self.duration * BYTES_PER_SECOND_1080P * (self.width * self.height) / (1920 * 1080) * 2
+            free = min(shutil.disk_usage(self.output_dir).free, shutil.disk_usage(self._job_dir).free)
+            if free < needed:
+                raise RuntimeError(
+                    f"ディスクの空き容量が足りない可能性があります（空き {free / 2**30:.1f}GB、必要量の目安 {needed / 2**30:.1f}GB）。"
+                    "保存先を変えるか、録画サイズを小さくしてください。"
+                )
+
             n = max(1, min(len(prepared), int(self.duration // MIN_SEGMENT_SECONDS) or 1))
             length = self.duration / n
             self.segments = [Segment(i, i * length, self.duration if i == n - 1 else (i + 1) * length) for i in range(n)]
@@ -271,10 +283,32 @@ class SplitJob:
                 seg.status = f"再試行中 ({exc})" if attempt < MAX_ATTEMPTS else f"失敗: {exc}"
         seg.path = None
 
+    def _wait_for_media_time(self, player, recorder, target, timeout=180.0):
+        deadline = time.monotonic() + timeout
+        last_kick = time.monotonic()
+        while time.monotonic() < deadline:
+            if self.cancel_event.is_set():
+                raise RuntimeError("中止しました")
+            if not recorder.running:
+                raise RuntimeError(recorder.error or "録画が停止しました")
+            st = player.state()
+            if not st.get("ok"):
+                raise RuntimeError("動画プレーヤーを見失いました")
+            t = float(st.get("t", 0.0))
+            if (t >= target and (target > 0 or t > 0)) or st.get("ended"):
+                return t
+            if st.get("paused") and time.monotonic() - last_kick > 2.0:
+                last_kick = time.monotonic()
+                player.play()
+            remaining = target - t
+            time.sleep(BOUNDARY_POLL_SECONDS if remaining < 0.15 else min(POLL_SECONDS, remaining - 0.12))
+        raise RuntimeError("再生が始まりませんでした")
+
     def _record_segment(self, seg, window, player, attempt):
         seg.status = "頭出し中"
         seg.progress = 0.0
-        if not player.seek(seg.start):
+        preroll_from = max(0.0, seg.start - PREROLL_SECONDS)
+        if not player.seek(preroll_from):
             raise RuntimeError("再生位置を移動できませんでした")
         if self.pin_video:
             try:
@@ -282,7 +316,7 @@ class SplitJob:
             except CDPError:
                 pass
             time.sleep(0.5)
-            player.seek(seg.start)
+            player.seek(preroll_from)
         player.wait_buffered(PREBUFFER_SECONDS, seg.end, 10, self.cancel_event.is_set)
 
         part = os.path.join(self._job_dir, f"part{seg.index + 1:02d}_{attempt}.mp4")
@@ -297,15 +331,19 @@ class SplitJob:
         try:
             if not recorder.ready.wait(30):
                 raise RuntimeError(recorder.error or "録画を開始できませんでした")
-            while recorder.elapsed() < WARMUP_SECONDS - 0.03:
-                if not recorder.running:
-                    raise RuntimeError(recorder.error or "録画が停止しました")
+            recorder.pause_at_frame(round(WARMUP_SECONDS * self.settings.fps))
+            deadline = time.monotonic() + 30
+            while not recorder.paused:
+                if not recorder.running or time.monotonic() > deadline:
+                    raise RuntimeError(recorder.error or "録画を開始できませんでした")
                 time.sleep(0.005)
             result = player.play()
-            if result not in ("ok", None, True):
+            if result not in PLAY_OK:
                 raise RuntimeError(f"再生できませんでした: {result}")
+            t = self._wait_for_media_time(player, recorder, seg.start)
+            recorder.resume()
             seg.status = "録画中"
-            last_t = seg.start
+            last_t = t
             last_change = time.monotonic()
             stalled_at = None
             last_kick = 0.0
@@ -322,7 +360,8 @@ class SplitJob:
                 now = time.monotonic()
                 t = float(st.get("t", 0.0))
                 if stalled_at is None:
-                    if t >= seg.end - 0.005 or st.get("ended"):
+                    if t >= seg.end or st.get("ended"):
+                        recorder.pause()
                         player.pause()
                         break
                     if t > last_t + 0.002:
@@ -343,7 +382,7 @@ class SplitJob:
                         time.sleep(SEEK_SETTLE_SECONDS)
                         recorder.resume()
                         result = player.play()
-                        if result not in ("ok", None, True):
+                        if result not in PLAY_OK:
                             raise RuntimeError(f"再生できませんでした: {result}")
                         last_t = stalled_at
                         last_change = time.monotonic()
@@ -354,9 +393,9 @@ class SplitJob:
                     recorder.pause()
                     stalled_at = last_t
                 seg.progress = min(1.0, max(0.0, (t - seg.start) / max(0.001, seg.end - seg.start)))
-                time.sleep(0.02 if seg.end - t < 1.5 else POLL_SECONDS)
+                remaining = seg.end - t
+                time.sleep(BOUNDARY_POLL_SECONDS if remaining < 0.15 else min(POLL_SECONDS, max(BOUNDARY_POLL_SECONDS, remaining - 0.12)))
         finally:
-            recorder.resume()
             recorder.stop()
             recorder.join(120)
 

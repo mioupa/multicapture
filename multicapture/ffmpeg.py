@@ -21,6 +21,7 @@ ENCODER_LABELS = {
 }
 
 _detected = None
+JOIN_FADE_SECONDS = 0.003
 
 
 def find_ffmpeg():
@@ -56,39 +57,55 @@ def detect_encoder(ffmpeg, preference="auto"):
     return _detected
 
 
+def _list_line(path):
+    return "file '" + path.replace("\\", "/").replace("'", "'\\''") + "'\n"
+
+
+def _run(cmd, log):
+    log.write(" ".join(cmd) + "\n")
+    log.flush()
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log, creationflags=CREATE_NO_WINDOW).returncode
+
+
 def concat(ffmpeg, parts, output, log_path):
-    list_path = output + ".parts.txt"
-    with open(list_path, "w", encoding="utf-8") as f:
-        for part, duration in parts:
-            escaped = part.replace("\\", "/").replace("'", "'\\''")
-            f.write(f"file '{escaped}'\n")
-            if duration:
-                f.write(f"outpoint {duration:.6f}\n")
-    inputs = []
-    chains = []
-    for k, (part, duration) in enumerate(parts, start=1):
-        inputs += ["-i", part]
-        trim = f"atrim=end={duration:.6f}," if duration else ""
-        chains.append(f"[{k}:a]{trim}asetpts=N/SR/TB[a{k}]")
-    labels = "".join(f"[a{k}]" for k in range(1, len(parts) + 1))
-    graph = ";".join(chains) + f";{labels}concat=n={len(parts)}:v=0:a=1[aout]"
-    cmd = [
-        ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
-        "-f", "concat", "-safe", "0", "-i", list_path,
-        *inputs,
-        "-filter_complex", graph,
-        "-map", "0:v:0", "-map", "[aout]",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart", output,
-    ]
+    video_list = output + ".video.txt"
+    audio_list = output + ".audio.txt"
+    temp = [video_list, audio_list]
     try:
         with open(log_path, "w", encoding="utf-8", errors="replace") as log:
-            code = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log, creationflags=CREATE_NO_WINDOW).returncode
+            with open(video_list, "w", encoding="utf-8") as vf, open(audio_list, "w", encoding="utf-8") as af:
+                for k, (part, duration) in enumerate(parts):
+                    vf.write(_list_line(part))
+                    if duration:
+                        vf.write(f"outpoint {duration:.6f}\n")
+                    filters = [f"atrim=end={duration:.6f}" if duration else "anull", "asetpts=N/SR/TB"]
+                    if k > 0:
+                        filters.append(f"afade=t=in:d={JOIN_FADE_SECONDS}")
+                    if duration and k < len(parts) - 1:
+                        filters.append(f"afade=t=out:st={max(0.0, duration - JOIN_FADE_SECONDS):.6f}:d={JOIN_FADE_SECONDS}")
+                    if duration:
+                        filters.append(f"apad=whole_dur={duration:.6f}")
+                    wav = part + ".wav"
+                    temp.append(wav)
+                    code = _run([ffmpeg, "-hide_banner", "-loglevel", "warning", "-y", "-i", part, "-vn",
+                                 "-af", ",".join(filters), "-c:a", "pcm_s16le", wav], log)
+                    if code != 0:
+                        raise RuntimeError(f"音声の切り出しに失敗しました (code {code})")
+                    af.write(_list_line(wav))
+            code = _run([
+                ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
+                "-f", "concat", "-safe", "0", "-i", video_list,
+                "-f", "concat", "-safe", "0", "-i", audio_list,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", output,
+            ], log)
     finally:
-        try:
-            os.remove(list_path)
-        except OSError:
-            pass
+        for path in temp:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     if code != 0:
         raise RuntimeError(f"動画の結合に失敗しました (code {code})")
 
@@ -104,7 +121,7 @@ def build_command(ffmpeg, width, height, fps, audio_pipe, sample_rate, channels,
         ]
     return [
         ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
-        "-thread_queue_size", "64", "-probesize", "32", "-analyzeduration", "0",
+        "-thread_queue_size", "16", "-probesize", "32", "-analyzeduration", "0",
         "-f", "rawvideo", "-pix_fmt", "bgra", "-video_size", f"{width}x{height}", "-framerate", str(fps),
         "-i", "pipe:0",
         "-thread_queue_size", "1024", "-probesize", "32", "-analyzeduration", "0",
