@@ -1,5 +1,4 @@
 import ctypes
-import math
 import os
 import queue
 import subprocess
@@ -36,11 +35,15 @@ CHANNELS = 2
 BLOCK_ALIGN = CHANNELS * 2
 AUDIO_QUEUE_CHUNKS = 3000
 AUDIO_TAIL_SECONDS = 0.3
-AUDIO_DELAY_SECONDS = 0.0
+AUDIO_DELAY_SECONDS = -0.025
 AUDIO_MAX_GAP_SECONDS = 30.0
 POLL_INTERVAL = 0.004
-PHASE_SMOOTHING = 0.98
-PHASE_LOCK_THRESHOLD = 0.3
+VIDEO_LATENCY_SECONDS = 0.08
+MAX_QUEUED_FRAMES = 4
+VIDEO_OFFSET_SMOOTHING = 0.1
+SEQ_CORRECT_THRESHOLD = 0.6
+VIDEO_OFFSET_FAST = 0.3
+VIDEO_OFFSET_SETTLE_FRAMES = 20
 MAX_CATCH_UP_SECONDS = 15
 
 
@@ -85,7 +88,7 @@ def even(n):
 
 class SlotRecorder:
     def __init__(self, index, slot, browser_window, settings, ffmpeg_path, encoder, on_status,
-                 output_path=None, trim_start=0.0, log_name=None):
+                 output_path=None, trim_start=0.0, log_name=None, key_frames=None, sequential=False):
         self.index = index
         self.slot = slot
         self.browser = browser_window
@@ -96,6 +99,8 @@ class SlotRecorder:
         self.stop_event = threading.Event()
         self.output_path = output_path
         self.trim_start = trim_start
+        self.key_frames = key_frames
+        self.sequential = sequential
         self.log_name = log_name or f"slot{index + 1}_ffmpeg.log"
         self.error = None
         self.frames_written = 0
@@ -107,6 +112,7 @@ class SlotRecorder:
         self._t0 = None
         self._pauses = []
         self._pause_at = None
+        self._video_offset = None
 
     def _timeline_at(self, wall):
         total = wall - self._t0
@@ -212,7 +218,7 @@ class SlotRecorder:
             cmd = ffmpeg.build_command(
                 self.ffmpeg_path, cap_w, cap_h, fps, pipe.path, SAMPLE_RATE, CHANNELS,
                 out_w, out_h, self.encoder, self.output_path, trim_start=self.trim_start,
-                no_bframes=self.trim_start > 0,
+                no_bframes=self.trim_start > 0, key_frames=self.key_frames,
             )
             log = open(os.path.join(log_dir(), self.log_name), "w", encoding="utf-8", errors="replace")
             proc = subprocess.Popen(
@@ -273,7 +279,10 @@ class SlotRecorder:
         last_geometry = time.perf_counter()
         last_report = last_geometry
         period = 1.0 / fps
-        phase_x = phase_y = 0.0
+        next_seq = None
+        last_slot = None
+        settle = 0
+        self._video_offset = None
         while not self.stop_event.is_set():
             now = time.perf_counter()
             if now - last_geometry > 1.0:
@@ -286,23 +295,17 @@ class SlotRecorder:
                     capture.set_region(*offset)
             if capture.update():
                 self.new_frames += 1
-                angle = 2 * math.pi * ((capture.last_frame_time % period) / period)
-                phase_x = PHASE_SMOOTHING * phase_x + (1 - PHASE_SMOOTHING) * math.cos(angle)
-                phase_y = PHASE_SMOOTHING * phase_y + (1 - PHASE_SMOOTHING) * math.sin(angle)
             if self.paused:
+                next_seq = None
                 time.sleep(POLL_INTERVAL)
                 continue
-            due = int(self.elapsed() * fps) + 1
+            due = int((self.elapsed() - (VIDEO_LATENCY_SECONDS if self.sequential else 0.0)) * fps) + 1
             behind = due - self.frames_written
             if behind > fps * MAX_CATCH_UP_SECONDS:
                 self.frames_written = due - fps
                 behind = fps
             if behind > 0:
                 base = time.perf_counter() - self.elapsed()
-                locked = math.hypot(phase_x, phase_y) > PHASE_LOCK_THRESHOLD
-                if locked:
-                    arrival = (math.atan2(phase_y, phase_x) / (2 * math.pi) % 1.0) * period
-                    target = (arrival + period / 2) % period
             for _ in range(max(0, behind)):
                 if self.stop_event.is_set():
                     break
@@ -313,8 +316,47 @@ class SlotRecorder:
                     self._pause_snapped(self.frames_written / fps)
                     break
                 nominal = base + self.frames_written / fps
-                sample_time = nominal - ((nominal - target) % period) if locked else nominal
-                capture.write_to(write, sample_time)
+                if not self.sequential:
+                    capture.write_slot(write, capture.slot_at(nominal))
+                    self.frames_written += 1
+                    continue
+                if next_seq is None:
+                    self._video_offset = None
+                    first = capture.first_seq_after(nominal - period / 2)
+                    next_seq = first if first is not None else capture.seq + 1
+                oldest = capture.oldest_seq()
+                if oldest is not None and next_seq < oldest:
+                    next_seq = oldest
+                if capture.seq - next_seq >= MAX_QUEUED_FRAMES:
+                    next_seq = capture.seq - 1
+                if self._video_offset is not None and last_slot is not None:
+                    if self._video_offset > SEQ_CORRECT_THRESHOLD * period:
+                        self._video_offset -= period
+                        capture.write_slot(write, last_slot)
+                        self.frames_written += 1
+                        continue
+                    if self._video_offset < -SEQ_CORRECT_THRESHOLD * period:
+                        self._video_offset += period
+                        next_seq += 1
+                slot = capture.slot_of_seq(next_seq)
+                if slot is not None:
+                    next_seq += 1
+                    last_slot = slot
+                    diff = capture.ring_times[slot] - nominal
+                    if abs(diff) < 0.5:
+                        if self._video_offset is None:
+                            self._video_offset = diff
+                            settle = 0
+                        else:
+                            settle += 1
+                            alpha = VIDEO_OFFSET_FAST if settle < VIDEO_OFFSET_SETTLE_FRAMES else VIDEO_OFFSET_SMOOTHING
+                            self._video_offset += alpha * (diff - self._video_offset)
+                elif last_slot is None or capture.ring_seq[last_slot] < 0:
+                    slot = capture.head
+                    last_slot = slot
+                else:
+                    slot = last_slot
+                capture.write_slot(write, slot)
                 self.frames_written += 1
             if now - last_report > 1.0:
                 last_report = now
@@ -354,7 +396,7 @@ class SlotRecorder:
         def place(data, stamp):
             nonlocal written
             frames = len(data) // BLOCK_ALIGN
-            shift = AUDIO_DELAY_SECONDS
+            shift = AUDIO_DELAY_SECONDS if self.sequential else 0.0
             while frames > 0:
                 pos, resume_at = self.position_of(stamp + shift)
                 if pos is None:
@@ -405,7 +447,7 @@ class SlotRecorder:
             failure.append(exc)
         finally:
             if self.video_done.wait(10) and not failure:
-                target = int((self.frames_written / self.settings.fps + AUDIO_TAIL_SECONDS) * SAMPLE_RATE)
+                target = int((self.frames_written / self.settings.fps + (AUDIO_TAIL_SECONDS if self.sequential else 0.0)) * SAMPLE_RATE)
                 remaining = target - written
                 while remaining > 0:
                     chunk = min(remaining, SAMPLE_RATE)

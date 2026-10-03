@@ -147,6 +147,8 @@ class WindowCapture:
         self.pool_size = SizeInt32()
         self.ring = []
         self.ring_times = []
+        self.ring_seq = []
+        self.seq = 0
         self.head = 0
         self.last_frame_time = 0.0
         self.out_width = 0
@@ -192,6 +194,7 @@ class WindowCapture:
             release(tex)
         self.ring = [self.device.create_staging(width, height) for _ in range(RING_SIZE)]
         self.ring_times = [float("-inf")] * RING_SIZE
+        self.ring_seq = [-1] * RING_SIZE
         self.head = 0
         self.out_width = width
         self.out_height = height
@@ -204,16 +207,6 @@ class WindowCapture:
             return now
         t = stamp.value * 1e-7
         return t if abs(t - now) < 2.0 else now
-
-    def _slot_for(self, sample_time):
-        if sample_time is None:
-            return self.head
-        for back in range(RING_SIZE):
-            slot = (self.head - back) % RING_SIZE
-            if self.ring_times[slot] <= sample_time:
-                return slot
-        valid = [i for i in range(RING_SIZE) if self.ring_times[i] > float("-inf")]
-        return min(valid, key=lambda i: self.ring_times[i]) if valid else self.head
 
     def set_region(self, left, top):
         self.region = (max(0, left), max(0, top))
@@ -232,18 +225,16 @@ class WindowCapture:
 
     def update(self):
         try_next = method(self.pool, 7, HRESULT, ctypes.POINTER(ctypes.c_void_p))
-        latest = None
+        got = False
         while True:
             frame = ctypes.c_void_p()
             if failed(try_next(ctypes.byref(frame))) or not frame.value:
                 break
-            if latest is not None:
-                close_winrt(latest)
-                release(latest)
-            latest = frame
-        if latest is None:
-            return False
+            self._consume(frame)
+            got = True
+        return got
 
+    def _consume(self, latest):
         content = SizeInt32()
         method(latest, 8, HRESULT, ctypes.POINTER(SizeInt32))(ctypes.byref(content))
         self.last_frame_time = self._frame_time(latest)
@@ -259,6 +250,8 @@ class WindowCapture:
                 slot = (self.head + 1) % RING_SIZE
                 self.device.copy_region(self.ring[slot], tex, D3D11_BOX(left, top, 0, right, bottom, 1))
                 self.ring_times[slot] = self.last_frame_time
+                self.seq += 1
+                self.ring_seq[slot] = self.seq
                 self.head = slot
                 self.has_frame = True
             release(tex)
@@ -273,8 +266,38 @@ class WindowCapture:
             )
         return True
 
-    def write_to(self, sink, sample_time=None):
-        tex = self.ring[self._slot_for(sample_time)]
+    def slot_of_seq(self, seq):
+        for slot in range(RING_SIZE):
+            if self.ring_seq[slot] == seq:
+                return slot
+        return None
+
+    def oldest_seq(self):
+        valid = [s for s in self.ring_seq if s >= 0]
+        return min(valid) if valid else None
+
+    def first_seq_after(self, wall):
+        candidates = [(self.ring_seq[i], self.ring_times[i]) for i in range(RING_SIZE) if self.ring_seq[i] >= 0 and self.ring_times[i] >= wall]
+        return min(candidates)[0] if candidates else None
+
+    def slot_at(self, wall):
+        best = None
+        for slot in range(RING_SIZE):
+            if self.ring_seq[slot] >= 0 and self.ring_times[slot] <= wall:
+                if best is None or self.ring_times[slot] > self.ring_times[best]:
+                    best = slot
+        if best is not None:
+            return best
+        valid = [s for s in range(RING_SIZE) if self.ring_seq[s] >= 0]
+        return min(valid, key=lambda s: self.ring_times[s]) if valid else self.head
+
+    def write_slot(self, sink, slot):
+        self._write_texture(sink, self.ring[slot])
+
+    def write_to(self, sink):
+        self._write_texture(sink, self.ring[self.head])
+
+    def _write_texture(self, sink, tex):
         mapped = self.device.map(tex)
         try:
             row = self.out_width * 4

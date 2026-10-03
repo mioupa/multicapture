@@ -19,6 +19,11 @@ STALL_SECONDS = 0.2
 POLL_SECONDS = 0.05
 BOUNDARY_POLL_SECONDS = 0.002
 PREROLL_SECONDS = 1.5
+END_FLUSH_SECONDS = 0.25
+TIMESTAMP_GUARD_SECONDS = 0.002
+JOIN_LEAD_SECONDS = 1.5
+JOIN_TAIL_SECONDS = 0.5
+JOIN_SEARCH_TOLERANCE = 0.25
 BYTES_PER_SECOND_1080P = 1_000_000
 PLAY_OK = ("ok", "pending", None, True)
 PREBUFFER_SECONDS = 5.0
@@ -88,6 +93,9 @@ class Segment:
     path: str = None
     duration: float = 0.0
     error: str = None
+    lead: float = 0.0
+    tail: float = 0.0
+    stop_media: float = 0.0
 
 
 class SplitJob:
@@ -117,6 +125,7 @@ class SplitJob:
         self._lock = threading.Lock()
         self._job_dir = os.path.join(work_dir(), uuid.uuid4().hex[:8])
         self._muter = SpeakerMute(speaker_state_path())
+        self._join_log = []
 
     @property
     def running(self):
@@ -211,6 +220,9 @@ class SplitJob:
             n = max(1, min(len(prepared), int(self.duration // MIN_SEGMENT_SECONDS) or 1))
             length = self.duration / n
             self.segments = [Segment(i, i * length, self.duration if i == n - 1 else (i + 1) * length) for i in range(n)]
+            for seg in self.segments:
+                seg.lead = JOIN_LEAD_SECONDS if seg.index > 0 else 0.0
+                seg.tail = JOIN_TAIL_SECONDS if seg.index < n - 1 else 0.0
             for extra in prepared[n:]:
                 extra[1].close()
                 extra[0].close(timeout=5)
@@ -243,7 +255,7 @@ class SplitJob:
                 raise RuntimeError(f"区間 {', '.join(str(s.index + 1) for s in failed)} の録画に失敗しました: {failed[0].error}")
 
             self._status("区間をつなげて1本の動画にしています…")
-            ffmpeg.concat(self.ffmpeg_path, [(s.path, s.duration) for s in self.segments], self.output_path, os.path.join(log_dir(), "split_concat.log"))
+            ffmpeg.concat(self.ffmpeg_path, self._join_points(), self.output_path, os.path.join(log_dir(), "split_concat.log"))
             self._emit("done", self.output_path)
         except Exception as exc:
             self.error = str(exc)
@@ -283,6 +295,33 @@ class SplitJob:
                 seg.status = f"再試行中 ({exc})" if attempt < MAX_ATTEMPTS else f"失敗: {exc}"
         seg.path = None
 
+    def _join_points(self):
+        fps = self.settings.fps
+        points = []
+        for k, seg in enumerate(self.segments):
+            inpoint = seg.lead if seg.lead > 0 else 0.0
+            outpoint = seg.duration
+            if k < len(self.segments) - 1:
+                nxt = self.segments[k + 1]
+                nominal = max(0.0, seg.duration - max(0.0, seg.stop_media - seg.end))
+                found = None
+                try:
+                    found = ffmpeg.find_join(self.ffmpeg_path, seg.path, seg.duration, nxt.path, nxt.lead, fps, nominal)
+                except OSError:
+                    found = None
+                if found is not None and abs(found - nominal) <= JOIN_SEARCH_TOLERANCE:
+                    outpoint = found - TIMESTAMP_GUARD_SECONDS
+                else:
+                    outpoint = nominal
+                self._join_log.append(f"join {k + 1}->{k + 2}: nominal {nominal:.4f} matched {found} used {outpoint:.4f}")
+            points.append((seg.path, inpoint, outpoint))
+        try:
+            with open(os.path.join(log_dir(), "split_joins.log"), "w", encoding="utf-8") as f:
+                f.write("\n".join(self._join_log) + "\n")
+        except OSError:
+            pass
+        return points
+
     def _wait_for_media_time(self, player, recorder, target, timeout=180.0):
         deadline = time.monotonic() + timeout
         last_kick = time.monotonic()
@@ -307,7 +346,7 @@ class SplitJob:
     def _record_segment(self, seg, window, player, attempt):
         seg.status = "頭出し中"
         seg.progress = 0.0
-        preroll_from = max(0.0, seg.start - PREROLL_SECONDS)
+        preroll_from = max(0.0, seg.start - seg.lead - PREROLL_SECONDS)
         if not player.seek(preroll_from):
             raise RuntimeError("再生位置を移動できませんでした")
         if self.pin_video:
@@ -319,11 +358,12 @@ class SplitJob:
             player.seek(preroll_from)
         player.wait_buffered(PREBUFFER_SECONDS, seg.end, 10, self.cancel_event.is_set)
 
-        part = os.path.join(self._job_dir, f"part{seg.index + 1:02d}_{attempt}.mp4")
+        part = os.path.join(self._job_dir, f"part{seg.index + 1:02d}_{attempt}.mkv")
         recorder = SlotRecorder(
             seg.index, Slot(f"part{seg.index + 1}", self.url, self.width, self.height), window, self.settings,
             self.ffmpeg_path, self.encoder, lambda i, text: None,
             output_path=part, trim_start=WARMUP_SECONDS, log_name=f"split_part{seg.index + 1}.log",
+            key_frames=[seg.lead] if seg.lead > 0 else None, sequential=True,
         )
         with self._lock:
             self._recorders.append(recorder)
@@ -340,7 +380,7 @@ class SplitJob:
             result = player.play()
             if result not in PLAY_OK:
                 raise RuntimeError(f"再生できませんでした: {result}")
-            t = self._wait_for_media_time(player, recorder, seg.start)
+            t = self._wait_for_media_time(player, recorder, seg.start - seg.lead)
             recorder.resume()
             seg.status = "録画中"
             last_t = t
@@ -360,9 +400,12 @@ class SplitJob:
                 now = time.monotonic()
                 t = float(st.get("t", 0.0))
                 if stalled_at is None:
-                    if t >= seg.end or st.get("ended"):
+                    if t >= seg.end + seg.tail or st.get("ended"):
+                        if seg.tail == 0:
+                            time.sleep(END_FLUSH_SECONDS)
                         recorder.pause()
                         player.pause()
+                        seg.stop_media = t
                         break
                     if t > last_t + 0.002:
                         last_t = t
