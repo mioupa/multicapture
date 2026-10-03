@@ -52,7 +52,7 @@ def fmt_time(seconds):
     return f"{s // 3600:d}:{s // 60 % 60:02d}:{s % 60:02d}"
 
 
-def safe_name(text, fallback="lecture"):
+def safe_name(text, fallback="video"):
     cleaned = "".join(c if c.isalnum() or c in "-_ ()[]（）「」" else "_" for c in (text or "")).strip(" _")
     return cleaned[:80] or fallback
 

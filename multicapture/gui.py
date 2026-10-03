@@ -175,7 +175,7 @@ class App:
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(6, 0))
         self.split_tab = ttk.Frame(self.notebook, padding=10)
         self.dash_tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.split_tab, text="  講義動画を高速録画  ")
+        self.notebook.add(self.split_tab, text="  動画を高速録画  ")
         self.notebook.add(self.dash_tab, text="  ページを同時録画  ")
         self._build_split_tab(self.split_tab)
         self._build_dash_tab(self.dash_tab)
