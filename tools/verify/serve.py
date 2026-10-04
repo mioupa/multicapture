@@ -4,7 +4,8 @@
   python3 tools/verify/serve.py [--port 8765]
   open  http://127.0.0.1:8765/?src=test_5min.mp4      (index.html: one <video controls autoplay>)
 
-Query params of the page: src (default test_5min.mp4), muted=1 (default 0), loop=1.
+Query params of the page: src (default test_5min.mp4), muted=1 (default 0), loop=1,
+vol=0..1 (element volume; e.g. vol=0.05 keeps tests quiet while still recording the beeps).
 The page has exactly one <video> and no overlays, so the app's "動画を高速録画" can find it
 (duration > 0 after metadata load) and pin it full-window.
 """
@@ -26,6 +27,7 @@ INDEX = """<!doctype html>
 <script>
 var q = new URLSearchParams(location.search), v = document.getElementById('v');
 v.muted = q.get('muted') === '1'; v.loop = q.get('loop') === '1';
+var vol = parseFloat(q.get('vol')); if (vol >= 0 && vol <= 1) v.volume = vol;
 v.src = q.get('src') || 'test_5min.mp4';
 var p = v.play(); if (p && p.catch) p.catch(function () {});  // autoplay with sound may need a click
 </script>

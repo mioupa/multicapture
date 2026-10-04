@@ -1,4 +1,5 @@
 import unittest
+import unittest.mock
 
 from multicapture.recorder import (
     AUDIO_DELAY_SECONDS, AUDIO_MAX_GAP_SECONDS, BLOCK_ALIGN, SAMPLE_RATE, AudioPlacer, SlotRecorder,
@@ -108,8 +109,10 @@ class PlaceTests(unittest.TestCase):
         self.assertEqual(h.silence_frames(), 0)
         self.assertEqual(h.placer.written, 480)
 
+    @unittest.mock.patch("multicapture.recorder.AUDIO_DELAY_SECONDS", -0.025)
     def test_sequential_shift(self):
-        self.assertLess(AUDIO_DELAY_SECONDS, 0)
+        # the Windows value; on mac the helper already corrects the timestamps and the delay is 0
+        from multicapture.recorder import AUDIO_DELAY_SECONDS
         # stamped exactly at t0: with the shift the chunk starts before t0 and is dropped
         h = Harness(sequential=True)
         h.placer.place(chunk(480), T0)

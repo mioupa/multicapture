@@ -53,7 +53,7 @@ mc-capture [--disclaim] serve
 - `permission`：`{"screen":bool,"audio":"granted|denied|unknown"}`
 - `windows`：`{"windows":[{"window_id","pid","title","frame":[x,y,w,h],"on_screen","layer"}]}`
 - `video_started`、`first_frame`：`first_frame` には `w`、`h`、`content_rect`、`content_scale`、`scale_factor`、`pts` を入れる。
-- `audio_started`：`{"pids":[…],"device":"出力デバイス名","device_rate":…}`
+- `audio_started`：`{"pids":[…],"device":"出力デバイス名","device_rate":…,"output_latency":秒}`
 - `stats`：1 秒ごとに出す。`{"complete":n,"idle":n,"other":n,"audio_frames":n,"audio_zero":bool,"shm_skipped":n}`。数値は直近 1 秒の値。
 - `stall`、`resume`：映像のコマが 2 秒届かないと `stall` を、届き始めたら `resume`（`gap` 秒を付ける）を出す。
 - `audio_rebuilt`：`{"reason":"device_changed|rate_changed|silent_tap|process_changed"}`。タップと集約デバイスを作り直したときに出す。
@@ -76,11 +76,11 @@ mc-capture [--disclaim] serve
 - Python 側があらかじめ `os.mkfifo` で作ったパスを、`start_audio` の `fifo` で渡す。補助プログラムは書き込み側として開く。
 - 中身はレコードの並びで、1 レコードは次のとおり（リトルエンディアン）。
   - u32 magic `0x5541434D`（"MCAU"）
-  - f64 timestamp：先頭サンプルのホスト時刻（秒）
+  - f64 timestamp：先頭サンプルが出力デバイスで鳴る時刻（ホスト時刻、秒）
   - u32 frames
   - frames × 4 バイト：s16le、48kHz、ステレオ
 - 変換：集約デバイスの実際の入力形式（主デバイスのレートで動く。例：192kHz の float32）を、AVAudioConverter で 48kHz の s16le ステレオにする。
-- timestamp は、IOProc の `inInputTime.mHostTime` から求めた、変換前のバッファの先頭時刻とする（変換器の遅延は無視してよい）。
+- timestamp は、IOProc の `inInputTime.mHostTime` から求めた変換前のバッファの先頭時刻に、出力デバイスの遅延 `output_latency`（デバイスの遅延、安全余裕、バッファ、ストリームの遅延の合計をレートで割ったもの）を足した値とする。タップの音は鳴る前のもので、Chrome は鳴る時刻に映像を合わせるため。変換器の遅延は無視してよい。
 - 書き込みが詰まっても IOProc を止めない。音声は内部のキューを通して別のスレッドで書き、キューが溢れたら古いものから捨てて `stats` で数える。
 
 ## 音声の作り直し

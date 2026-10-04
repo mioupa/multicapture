@@ -12,7 +12,7 @@ from .win32 import KeepAwake, primary_screen_size, set_dpi_awareness
 __all__ = [
     "NAME", "clock", "thread_init", "popen_kwargs",
     "BROWSER_LABELS", "DEFAULT_BROWSER", "available_browsers", "BrowserWindow",
-    "open_window_capture", "open_audio_capture", "AudioPipe", "MUTE_VIA_CAPTURE", "SpeakerMute",
+    "open_window_capture", "open_audio_capture", "AudioPipe", "MUTE_VIA_CAPTURE", "SEQUENTIAL_AUDIO_DELAY", "SpeakerMute",
     "restore_speakers_if_needed", "KeepAwake", "DISPLAY_ALWAYS_ON",
     "default_data_dir", "default_output_dir", "FFMPEG_NAME", "ffmpeg_candidates", "open_folder",
     "physical_memory_bytes", "TK_THEME", "UI_FONT", "set_dpi_awareness", "primary_screen_size",
@@ -22,6 +22,7 @@ __all__ = [
 NAME = "windows"
 DEFAULT_BROWSER = "edge"
 MUTE_VIA_CAPTURE = False
+SEQUENTIAL_AUDIO_DELAY = -0.025
 DISPLAY_ALWAYS_ON = False
 FFMPEG_NAME = "ffmpeg.exe"
 TK_THEME = "vista"

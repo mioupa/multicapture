@@ -20,6 +20,7 @@ Module-level names every implementation exports:
     open_audio_capture(browser_window, sample_rate, channels, mute=False) -> AudioCapture
     AudioPipe            see AudioPipe below
     MUTE_VIA_CAPTURE     True when muting is done by open_audio_capture(mute=True) (mac)
+    SEQUENTIAL_AUDIO_DELAY  seconds added to audio timestamps in split (sequential) recordings
     SpeakerMute          see SpeakerMute below
     restore_speakers_if_needed(state_path)
 

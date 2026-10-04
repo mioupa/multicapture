@@ -20,6 +20,27 @@ func caScalar<T: BitwiseCopyable>(_ obj: AudioObjectID, _ sel: AudioObjectProper
     return (v, st)
 }
 
+/// 出力デバイスで、IOProc に渡した音が実際に鳴るまでの遅れ（秒）。
+/// デバイスの遅延・安全余裕・バッファ・ストリームの遅延の合計を、デバイスのレートで割る。
+func caOutputLatency(_ dev: AudioDeviceID) -> Double {
+    let out = kAudioObjectPropertyScopeOutput
+    let (rate, _) = caScalar(dev, kAudioDevicePropertyNominalSampleRate, Float64(0))
+    guard rate > 0 else { return 0 }
+    let (lat, _) = caScalar(dev, kAudioDevicePropertyLatency, UInt32(0), scope: out)
+    let (safety, _) = caScalar(dev, kAudioDevicePropertySafetyOffset, UInt32(0), scope: out)
+    let (buffer, _) = caScalar(dev, kAudioDevicePropertyBufferFrameSize, UInt32(0), scope: out)
+    var a = caAddr(kAudioDevicePropertyStreams, scope: out)
+    var size: UInt32 = 0
+    var streamLat: UInt32 = 0
+    if AudioObjectGetPropertyDataSize(dev, &a, 0, nil, &size) == noErr, size >= UInt32(MemoryLayout<AudioStreamID>.size) {
+        var streams = [AudioStreamID](repeating: 0, count: Int(size) / MemoryLayout<AudioStreamID>.size)
+        if AudioObjectGetPropertyData(dev, &a, 0, nil, &size, &streams) == noErr, let s = streams.first {
+            streamLat = caScalar(s, kAudioStreamPropertyLatency, UInt32(0)).0
+        }
+    }
+    return Double(lat + safety + buffer + streamLat) / rate
+}
+
 func caString(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector) -> String? {
     var a = caAddr(sel)
     var cf: Unmanaged<CFString>? = nil
@@ -112,6 +133,8 @@ final class Pipeline {
     let objs: [AudioObjectID]
     let outDev: AudioDeviceID
     let outName: String
+    /// タップの音は出力デバイスで鳴る前のもの。Chrome は鳴る時刻に映像を合わせるので、この分を足す。
+    let outputLatency: Double
     private(set) var rate = 0.0
     let startT = nowSec()
     private let fifo: FifoWriter
@@ -139,6 +162,7 @@ final class Pipeline {
     init(pids: [Int32], objs: [AudioObjectID], outDev: AudioDeviceID, outName: String,
          fifo: FifoWriter, listenerQ: DispatchQueue) {
         self.pids = pids; self.objs = objs; self.outDev = outDev; self.outName = outName
+        self.outputLatency = caOutputLatency(outDev)
         self.fifo = fifo; self.listenerQ = listenerQ
     }
 
@@ -300,7 +324,7 @@ final class Pipeline {
         }
         var ts = ticksToSec(inTime.mHostTime)
         if inTime.mFlags.rawValue & AudioTimeStampFlags.hostTimeValid.rawValue == 0 { ts = ticksToSec(now.mHostTime) }
-        fifo.enqueue(makeAudioRecord(timestamp: ts, frames: outFrames, payload: data))
+        fifo.enqueue(makeAudioRecord(timestamp: ts + outputLatency, frames: outFrames, payload: data))
     }
 
     // MARK: teardown
@@ -466,10 +490,11 @@ final class AudioCapture: AudioSession {
             pipeline = p
             if !startedEmitted {
                 startedEmitted = true
-                emit("audio_started", ["pids": p.pids.map { Int($0) }, "device": p.outName, "device_rate": p.rate], id: startId)
+                emit("audio_started", ["pids": p.pids.map { Int($0) }, "device": p.outName, "device_rate": p.rate,
+                                        "output_latency": p.outputLatency], id: startId)
                 pendingReason = nil
             } else if let r = pendingReason {
-                emit("audio_rebuilt", ["reason": r])
+                emit("audio_rebuilt", ["reason": r, "device": p.outName, "output_latency": p.outputLatency])
                 pendingReason = nil
             }
         } catch let f as CAFailure {

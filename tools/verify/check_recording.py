@@ -142,7 +142,20 @@ def analyze_video(nums, times):
     res["frames_read"] = len(nums)
     res["distinct"] = len(seen)
     res["missing_count"] = sum(e["count"] for e in res["missing_events"])
-    res["dup_count"] = sum(c - 1 for c in seen.values() if c > 1)
+    # The first and last frames are held while the recording starts and after the source ends;
+    # report those holds separately instead of as duplicates.
+    idx = [i for i, n in enumerate(nums) if n is not None]
+    head = tail = 0
+    while head + 1 < len(idx) and nums[idx[head + 1]] == nums[idx[0]]:
+        head += 1
+    while tail + 1 < len(idx) and nums[idx[-2 - tail]] == nums[idx[-1]]:
+        tail += 1
+    if ok and ok[0] == ok[-1]:
+        tail = 0
+    edge = set(idx[1:head + 1]) | set(idx[len(idx) - tail:]) if tail else set(idx[1:head + 1])
+    res["dup_events"] = [e for e in res["dup_events"] if e["index"] not in edge]
+    res["head_hold"], res["tail_hold"] = head, tail
+    res["dup_count"] = sum(c - 1 for c in seen.values() if c > 1) - head - tail
     # numbers absent from the min..max range of what was seen (also covers re-runs after backward jumps)
     res["missing_numbers"] = [x for x in range(min(seen), max(seen) + 1) if x not in seen] if seen else []
     return res
@@ -304,7 +317,8 @@ def summarize(r):
     L = [f"{os.path.basename(r['file'])}  {r['size']}  {r['duration']:.1f}s  fps={r['fps']}  pts={'container' if r['pts_from_container'] else 'assumed CFR'}"]
     L.append(f"frames read {v['frames_read']}  distinct {v['distinct']}  first {v['first']}  last {v['last']}  undecoded {len(v['undecoded'])}"
              + (f" ({ranges(v['undecoded'][:50])}...)" if v["undecoded"] else ""))
-    L.append(f"missing {v['missing_count']}  duplicates {v['dup_count']}  backwards {len(v['backward_events'])}")
+    L.append(f"missing {v['missing_count']}  duplicates {v['dup_count']}  backwards {len(v['backward_events'])}"
+             f"  (held: first frame +{v.get('head_hold', 0)}, last frame +{v.get('tail_hold', 0)})")
     for e in v["missing_events"][:6]:
         L.append(f"  missing {e['from']}-{e['to']} ({e['count']}) at out frame {e['index']} t={fmt_t(e['time'])}")
     if len(v["missing_events"]) > 6:
