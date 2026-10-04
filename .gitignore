@@ -8,3 +8,5 @@ tools/mac-spike/build/
 tools/mac-spike/results/
 tools/mac-spike/media/*.mp4
 tools/mac-spike/.venv/
+native/mac/build/
+tools/verify/media/

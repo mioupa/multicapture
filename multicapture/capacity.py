@@ -15,12 +15,13 @@ from datetime import datetime
 
 from . import ffmpeg
 from . import platform as osp
-from .config import data_dir, work_dir
+from .config import data_dir, log_dir, work_dir
 
 SAFETY = 0.85
 ABS_MAX = 16
 NVENC_MAX = 12
 MEMORY_RESERVE_GB = 4
+FALLBACK_LIMIT = 8  # used when the measurement fails (the old fixed limit)
 
 MEASURE_STREAMS = 3
 MEASURE_WARMUP = 1.0
@@ -35,6 +36,16 @@ SESSION_ERROR_MARKERS = {
 }
 
 _version_cache = {}
+_log_lock = threading.Lock()
+
+
+def _log(text):
+    """Append to data/logs/capacity.log so a failed measurement can be diagnosed."""
+    try:
+        with _log_lock, open(os.path.join(log_dir(), "capacity.log"), "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {text.rstrip()}\n")
+    except OSError:
+        pass
 
 
 class MeasureCancelled(Exception):
@@ -196,16 +207,19 @@ def _make_clip(ffmpeg_path, pix_fmt, path):
     cmd = [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
            "-f", "lavfi", "-i", f"testsrc2=size={MEASURE_WIDTH}x{MEASURE_HEIGHT}:rate={MEASURE_FPS}",
            "-frames:v", str(MEASURE_CLIP_FRAMES), "-pix_fmt", pix_fmt, "-f", "rawvideo", path]
+    _log("clip: " + subprocess.list2cmdline(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=60, **osp.popen_kwargs())
+    _log(f"clip: exit={proc.returncode} exists={os.path.isfile(path)}\n{proc.stderr}")
     if proc.returncode != 0 or not os.path.isfile(path):
-        raise RuntimeError("計測用の映像を作れませんでした: " + proc.stderr.strip()[-200:])
+        raise RuntimeError("計測用の映像を作れませんでした（詳細は capacity.log）: " + proc.stderr.strip()[-200:])
 
 
 def _probe_sessions(ffmpeg_path, encoder, count, on_progress, cancel, base, span):
     encode = ffmpeg.video_encode_args(encoder, 30)
     cmd = [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
            "-re", "-f", "lavfi", "-i", "color=black:s=320x180:r=30", "-t", "3", *encode, "-f", "null", "-"]
-    procs = [subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    _log(f"sessions x{count}: " + subprocess.list2cmdline(cmd))
+    procs = [subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                               **osp.popen_kwargs()) for _ in range(count)]
     try:
         deadline = time.monotonic() + 40
@@ -217,6 +231,12 @@ def _probe_sessions(ffmpeg_path, encoder, count, on_progress, cancel, base, span
             time.sleep(0.2)
     finally:
         _kill(procs)
+    for i, p in enumerate(procs):
+        if p.returncode != 0:
+            err = p.stderr.read().decode("utf-8", "replace") if p.stderr else ""
+            _log(f"sessions: #{i + 1} exit={p.returncode}\n{err[-600:]}")
+        if p.stderr:
+            p.stderr.close()
     return sum(1 for p in procs if p.returncode == 0)
 
 
@@ -286,6 +306,7 @@ def measure(ffmpeg_path, encoder, pix_fmt, on_progress=None, cancel=None, stream
                "-video_size", f"{MEASURE_WIDTH}x{MEASURE_HEIGHT}", "-framerate", str(MEASURE_FPS), "-i", clip,
                *encode, "-f", "null", "-"]
         procs = []
+        _log(f"throughput x{streams}: " + subprocess.list2cmdline(cmd))
         try:
             t0 = time.monotonic()
             for _ in range(streams):
@@ -297,7 +318,8 @@ def measure(ffmpeg_path, encoder, pix_fmt, on_progress=None, cancel=None, stream
                 if dead:
                     for t in dead[0].threads:
                         t.join(1)
-                    raise RuntimeError("エンコーダの計測に失敗しました: " + " ".join(dead[0].err[-3:])[-300:])
+                    _log(f"throughput: exit={dead[0].proc.returncode}\n" + "\n".join(dead[0].err))
+                    raise RuntimeError("エンコーダの計測に失敗しました（詳細は capacity.log）: " + " ".join(dead[0].err[-3:])[-300:])
                 frac = (time.monotonic() - t0) / (warmup + seconds)
                 _report(on_progress, base + (1 - base) * frac,
                         f"エンコーダの処理能力を計測しています（{streams}本を同時にエンコード）…")
@@ -318,6 +340,7 @@ def measure(ffmpeg_path, encoder, pix_fmt, on_progress=None, cancel=None, stream
         if rate <= 0:
             raise RuntimeError("エンコーダの計測に失敗しました（コマが出力されませんでした）")
         pps = rate * MEASURE_WIDTH * MEASURE_HEIGHT
+        _log(f"result: encoder={encoder} pix_fmt={pix_fmt} frames/s={rate:.1f} pixels/s={pps:.3e} session_cap={session_cap}")
         _report(on_progress, 1.0, "計測が終わりました")
         return Measurement(
             pixels_per_sec=pps, session_cap=session_cap, encoder=encoder, pix_fmt=pix_fmt,
