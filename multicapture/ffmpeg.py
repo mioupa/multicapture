@@ -10,8 +10,8 @@ ENCODERS = {
     "h264_amf": ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", "21", "-qp_p", "23"],
     "h264_qsv": ["-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "23"],
     "libx264": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"],
-    # provisional; quality is tuned in Phase 2 (§5.7)
-    "h264_videotoolbox": ["-c:v", "h264_videotoolbox", "-allow_sw", "0", "-q:v", "60"],
+    # q:v 55 matches x264 crf 23 in SSIM at 1.2-1.3x the bitrate (tools/verify/vt_quality.py)
+    "h264_videotoolbox": ["-c:v", "h264_videotoolbox", "-allow_sw", "0", "-q:v", "55"],
 }
 
 FORCED_IDR = {
