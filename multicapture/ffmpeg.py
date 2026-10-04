@@ -157,8 +157,10 @@ def find_join(ffmpeg, part_a, duration_a, part_b, at_b, fps, nominal_a, window=1
 def video_encode_args(encoder, fps, no_bframes=False, key_frames=None):
     """Output pixel format, encoder options, GOP and key frames: the video-encoding part shared by
     recordings (build_command) and the capacity measurement (capacity.py)."""
+    # VideoToolbox takes NV12 directly, which avoids a CPU conversion; the other encoders get yuv420p.
+    out_pix_fmt = "nv12" if encoder == "h264_videotoolbox" else "yuv420p"
     return [
-        "-pix_fmt", "yuv420p", *ENCODERS[encoder], "-g", str(fps * 2), *(["-bf", "0"] if no_bframes else []),
+        "-pix_fmt", out_pix_fmt, *ENCODERS[encoder], "-g", str(fps * 2), *(["-bf", "0"] if no_bframes else []),
         *(["-force_key_frames", ",".join(f"{t:.6f}" for t in key_frames), *FORCED_IDR.get(encoder, [])] if key_frames else []),
     ]
 
@@ -172,9 +174,12 @@ def build_command(ffmpeg, width, height, fps, audio_pipe, sample_rate, channels,
             f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2",
         ]
+    # ScreenCaptureKit NV12 is BT.709 video range (§5.4); tell FFmpeg so the encoder tags and converts correctly.
+    color_tags = ["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"] if pix_fmt == "nv12" else []
     return [
         ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
         "-thread_queue_size", "16", "-probesize", "32", "-analyzeduration", "0",
+        *color_tags,
         "-f", "rawvideo", "-pix_fmt", pix_fmt, "-video_size", f"{width}x{height}", "-framerate", str(fps),
         "-i", "pipe:0",
         "-thread_queue_size", "1024", "-probesize", "32", "-analyzeduration", "0",

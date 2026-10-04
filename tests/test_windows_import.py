@@ -126,12 +126,12 @@ class WindowsImportTests(unittest.TestCase):
 
 
 class BuildCommandIdenticalTests(unittest.TestCase):
-    """ffmpeg.build_command (refactored to share video_encode_args) must match HEAD's byte for byte."""
+    """ffmpeg.build_command (refactored to share video_encode_args) must match the 1.2.1 original (e111bb8) byte for byte."""
 
     @staticmethod
     def original_module():
         try:
-            src = subprocess.run(["git", "show", "HEAD:multicapture/ffmpeg.py"], cwd=ROOT, capture_output=True,
+            src = subprocess.run(["git", "show", "e111bb8:multicapture/ffmpeg.py"], cwd=ROOT, capture_output=True,
                                  text=True, timeout=30, check=True).stdout
         except (OSError, subprocess.SubprocessError):
             return None

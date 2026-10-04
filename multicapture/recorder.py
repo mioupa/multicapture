@@ -201,6 +201,7 @@ class SlotRecorder:
             cap_w, cap_h = even(min(cw, out_w)), even(min(ch, out_h))
 
             capture = osp.open_window_capture(self.browser)
+            capture.fps = fps  # used by the macOS helper (capture rate); ignored on Windows
             capture.start()
             capture.set_output(cap_w, cap_h)
             offset = self.browser.capture_offset() or (0, 0)

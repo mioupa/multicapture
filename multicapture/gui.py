@@ -10,7 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import __version__, capacity, ffmpeg
 from . import platform as osp
 from .browser import BROWSER_LABELS, BrowserWindow, available_browsers
-from .config import Settings, Slot, log_dir, profile_dir
+from .config import Settings, Slot, data_dir, log_dir, profile_dir
 from .recorder import SlotRecorder
 from .splitjob import LoginBrowser, SplitJob, cleanup_stale_work, fmt_time, restore_speakers_if_needed
 
@@ -100,8 +100,14 @@ class App:
     def __init__(self):
         osp.set_dpi_awareness()
         restore_speakers_if_needed()
+        if osp.NAME == "mac":
+            try:
+                osp.cleanup_leftovers(data_dir())   # browsers / helpers / caffeinate left by a crashed run
+            except Exception:
+                pass
         cleanup_stale_work()
         self.settings = Settings.load()
+        self.capture_hint = None
         self.browsers_found = available_browsers()
         if self.settings.browser not in self.browsers_found and self.browsers_found:
             self.settings.browser = next(iter(self.browsers_found))
@@ -130,6 +136,10 @@ class App:
         self._refresh_tree()
         self._update_buttons()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if osp.NAME == "mac":
+            # Cmd+Q goes through the same close path (recording confirmation, browser cleanup)
+            self.root.createcommand("::tk::mac::Quit", self._on_close)
+            threading.Thread(target=self._check_mac_permissions, daemon=True).start()
         self.root.after(100, self._poll)
         if self.ffmpeg_path:
             threading.Thread(target=self._detect_encoder, args=(self._encoder_pref(),), daemon=True).start()
@@ -296,6 +306,23 @@ class App:
         self.rec_btn = ttk.Button(bottom, text="● 録画開始", style="Accent.TButton", command=self._start_recording)
         self.rec_btn.pack(side="right", padx=6)
 
+    def _check_mac_permissions(self):
+        """Background: check screen/audio capture permissions; guide the user and ask for them when missing."""
+        app_name = "MultiCapture" if getattr(sys, "frozen", False) else "MultiCapture Capture"
+        guide = ("画面収録とシステムオーディオ録音の許可が必要です。\n"
+                 "システム設定 →「プライバシーとセキュリティ」→「画面収録とシステムオーディオ録音」を開き、"
+                 f"「{app_name}」をオンにしてください。\n（許可を変えたあとは、アプリを再起動してください）")
+        try:
+            perms = osp.check_permissions()
+            if osp.permissions_ok(perms):
+                return
+            self.events.put(("info", "⚠ 画面収録とシステムオーディオ録音の許可が必要です（システム設定 →「プライバシーとセキュリティ」）"))
+            perms = osp.request_permissions()
+            if not osp.permissions_ok(perms):
+                self.events.put(("notice", guide))
+        except Exception as exc:
+            self.events.put(("info", f"⚠ 録画用の補助プログラムを確認できませんでした: {str(exc)[:150]}"))
+
     def _set_info(self, extra=None):
         parts = []
         if not self.ffmpeg_path:
@@ -362,9 +389,17 @@ class App:
         return meas
 
     def _ensure_measurement(self, encoder):
+        """The cached or fresh measurement, or None when it fails: a failed measurement never blocks recording."""
         meas = capacity.load(self.ffmpeg_path, encoder)
         if meas is None:
-            meas = self._measure_now(encoder)
+            try:
+                meas = self._measure_now(encoder)
+            except capacity.MeasureCancelled:
+                raise
+            except Exception as exc:
+                self.events.put(("info", f"上限の計測に失敗したため、従来の上限 {capacity.FALLBACK_LIMIT} で録画します"
+                                         f"（詳細: data/logs/capacity.log / {str(exc)[:120]}）"))
+                return None
         return meas
 
     def _remeasure(self):
@@ -372,7 +407,13 @@ class App:
             return
 
         def work():
-            self._measure_now(self.encoder)
+            try:
+                self._measure_now(self.encoder)
+            except capacity.MeasureCancelled:
+                return
+            except Exception as exc:
+                self.events.put(("info", f"計測に失敗しました: {str(exc)[:200]}（詳細: data/logs/capacity.log）"))
+                return
             self.events.put(("info", "計測が終わりました"))
 
         self._run_background(work)
@@ -597,7 +638,7 @@ class App:
             self._emit_encoder(encoder)
             meas = self._ensure_measurement(encoder)
             slots = [self.settings.slots[i] for i in indices]
-            load = capacity.page_load(meas, slots, self.settings.fps)
+            load = capacity.page_load(meas, slots, self.settings.fps) if meas is not None else 0
             if load > 1:
                 need = load * capacity.SAFETY * meas.pixels_per_sec
                 self.events.put(("warn", (
@@ -707,12 +748,19 @@ class App:
             encoder = ffmpeg.detect_encoder(self.ffmpeg_path, self.settings.encoder)
             self._emit_encoder(encoder)
             meas = self._ensure_measurement(encoder)
-            limit, reason = capacity.limit_for(meas, size[0], size[1], self.settings.fps, osp.physical_memory_bytes())
             count = self.settings.split_count
-            if count > limit:
-                self.events.put(("notice", f"同時に録画する数を{count}から{limit}に減らして録画します（上限 {limit}：{reason}）。"))
-                count = limit
-                self.events.put(("split_count", count))
+            if meas is None:
+                if count > capacity.FALLBACK_LIMIT:
+                    self.events.put(("info", f"上限の計測に失敗したため、同時に録画する数を{count}から{capacity.FALLBACK_LIMIT}に減らして録画します"
+                                             "（詳細: data/logs/capacity.log）"))
+                    count = capacity.FALLBACK_LIMIT
+                    self.events.put(("split_count", count))
+            else:
+                limit, reason = capacity.limit_for(meas, size[0], size[1], self.settings.fps, osp.physical_memory_bytes())
+                if count > limit:
+                    self.events.put(("notice", f"同時に録画する数を{count}から{limit}に減らして録画します（上限 {limit}：{reason}）。"))
+                    count = limit
+                    self.events.put(("split_count", count))
             job = SplitJob(
                 url, count, size[0], size[1], self.settings.split_pin_video,
                 self.settings.output_dir, self.settings, exe, self.ffmpeg_path, encoder,
@@ -789,7 +837,10 @@ class App:
                 elif kind == "info":
                     self._set_info(payload)
                 elif kind == "notice":
-                    messagebox.showinfo("MultiCapture", payload)
+                    if self.unattended:
+                        self._set_info(payload)
+                    else:
+                        messagebox.showinfo("MultiCapture", payload)
                 elif kind == "warn":
                     # A modal box would stall this loop, which also handles the scheduled auto-stop.
                     if self.unattended:
@@ -815,6 +866,11 @@ class App:
                         self.stop_at = time.monotonic() + self.auto_duration
         except queue.Empty:
             pass
+        if osp.NAME == "mac":
+            hint = osp.capture_hint(self.settings.fps) if self._recording() else None
+            if hint != self.capture_hint:
+                self.capture_hint = hint
+                self._set_info("⚠ " + hint if hint else None)
         if not self._recording() and not self.busy:
             self.keep_awake.release()
         if self.stop_at and time.monotonic() >= self.stop_at:

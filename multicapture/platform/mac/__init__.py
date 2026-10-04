@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 __all__ = [
     "NAME", "clock", "thread_init", "popen_kwargs",
@@ -19,6 +20,7 @@ __all__ = [
     "default_data_dir", "default_output_dir", "FFMPEG_NAME", "ffmpeg_candidates", "open_folder",
     "physical_memory_bytes", "TK_THEME", "UI_FONT", "set_dpi_awareness", "primary_screen_size",
     "check_environment", "SCHEDULE_SUPPORTED", "HW_ENCODERS", "OVERLAP_HINT",
+    "check_permissions", "request_permissions", "permissions_ok", "cleanup_leftovers", "capture_hint",
 ]
 
 NAME = "mac"
@@ -31,6 +33,7 @@ UI_FONT = "Hiragino Sans"
 HW_ENCODERS = ["h264_videotoolbox"]
 OVERLAP_HINT = "録画中のウィンドウは一部が見えていればOK（完全に隠す・最小化は不可）"
 SCHEDULE_SUPPORTED = False
+STALL_HINT = "録画用ウィンドウが隠れているか最小化されています。一部でも見える状態にしてください"
 
 BROWSER_LABELS = {"chrome": "Google Chrome", "edge": "Microsoft Edge"}
 
@@ -38,8 +41,6 @@ _BROWSER_APPS = {
     "chrome": ("Google Chrome.app", "Google Chrome"),
     "edge": ("Microsoft Edge.app", "Microsoft Edge"),
 }
-
-_NOT_YET = "macOS capture is implemented in Phase 2"
 
 
 class _MachClock:
@@ -90,17 +91,97 @@ def available_browsers():
     return found
 
 
-class BrowserWindow:
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(_NOT_YET)
+from .browser import BrowserWindow  # noqa: E402
+from .capture import open_audio_capture, open_window_capture  # noqa: E402
+from . import helper as _helper  # noqa: E402
 
 
-def open_window_capture(browser_window):
-    raise NotImplementedError(_NOT_YET)
+def check_permissions():
+    """{"screen": bool, "audio": "granted|denied|unknown"} from the helper; raises HelperError if it cannot run."""
+    return _helper.check_permission()
 
 
-def open_audio_capture(browser_window, sample_rate, channels, mute=False):
-    raise NotImplementedError(_NOT_YET)
+def request_permissions():
+    """Ask for the missing permissions (shows the system dialogs); returns the same dict as check_permissions()."""
+    return _helper.request_permission()
+
+
+def permissions_ok(perms):
+    return bool(perms) and bool(perms.get("screen")) and perms.get("audio") == "granted"
+
+
+def capture_hint(fps):
+    """Message when a recording's video capture has stalled or runs far below `fps` (window hidden/minimized)."""
+    now = time.monotonic()
+    for session in _helper.active_sessions():
+        if not session.video_active or session.video_started_at is None or now - session.video_started_at < 5:
+            continue
+        if session.stalled:
+            return STALL_HINT
+        recent = [st for t, st in session.stats_history if now - t <= 3.5][-3:]
+        if len(recent) >= 3 and all(
+                st.get("complete", 0) + st.get("idle", 0) + st.get("other", 0) < 0.8 * fps for st in recent):
+            return STALL_HINT
+    return None
+
+
+def _process_table():
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    rows = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            rows.append((int(parts[0]), int(parts[1]), parts[2]))
+    return rows
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def cleanup_leftovers(profile_root, rows=None, kill=None):
+    """Kill processes a crashed earlier run left behind (§8): browsers whose --user-data-dir is under
+    `profile_root`, orphaned mc-capture helpers started from our own paths, and our `caffeinate -w <pid>`
+    whose pid is gone. Returns the list of killed pids. `rows`/`kill` are injectable for tests."""
+    import re
+    import signal
+
+    roots = {os.path.abspath(profile_root), os.path.realpath(profile_root)}
+    roots |= {r.replace(os.sep + "private", "", 1) for r in list(roots) if r.startswith(os.sep + "private")}
+    prefixes = tuple(f"--user-data-dir={r.rstrip(os.sep)}{os.sep}" for r in roots)
+    helpers = tuple(_helper.helper_executables())
+    me = os.getpid()
+    ancestors = {me, os.getppid()}
+    victims = []
+    for pid, ppid, cmd in (rows if rows is not None else _process_table()):
+        if pid in ancestors:
+            continue
+        if any(p in cmd for p in prefixes) or any(cmd.endswith("--user-data-dir=" + r.rstrip(os.sep)) for r in roots):
+            victims.append(pid)
+        elif ppid == 1 and any(cmd.startswith(h + " ") for h in helpers) and re.search(r"\sserve$", cmd):
+            victims.append(pid)
+        else:
+            m = re.match(r"^(?:/usr/bin/)?caffeinate -d -i -w (\d+)$", cmd)
+            if m and not _pid_alive(int(m.group(1))):
+                victims.append(pid)
+    if not victims:
+        return []
+    kill = kill or os.kill
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in victims:
+            try:
+                kill(pid, sig)
+            except OSError:
+                pass
+        if sig == signal.SIGTERM and kill is os.kill:
+            time.sleep(1.0)
+    return victims
 
 
 class AudioPipe:
