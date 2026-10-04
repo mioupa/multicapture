@@ -198,8 +198,6 @@ final class VideoCapture: NSObject, SCStreamOutput, SCStreamDelegate, VideoSessi
             gStats.update { $0.shmSkipped += 1 }
             return
         }
-        seq += 1
-        let mySeq = seq
         let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
@@ -207,8 +205,16 @@ final class VideoCapture: NSObject, SCStreamOutput, SCStreamDelegate, VideoSessi
             gStats.update { $0.shmSkipped += 1 }
             return
         }
-        ring.write(seq: mySeq, pts: pts, plane0: p0, stride0: CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-                   plane1: p1, stride1: CVPixelBufferGetBytesPerRowOfPlane(pb, 1))
+        let stride0 = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), stride1 = CVPixelBufferGetBytesPerRowOfPlane(pb, 1)
+        // SCK は中身の変わらないコマも渡してくる（30fps の動画で平均 40 コマ/秒）。区間録画は届いたコマを
+        // 順に書くので、WGC と同じく「変わったときだけ」リングに入れる。
+        if ring.sameAsLatest(plane0: p0, stride0: stride0, plane1: p1, stride1: stride1) {
+            gStats.update { $0.unchanged += 1 }
+            return
+        }
+        seq += 1
+        let mySeq = seq
+        ring.write(seq: mySeq, pts: pts, plane0: p0, stride0: stride0, plane1: p1, stride1: stride1)
 
         if !firstFrameDone {
             firstFrameDone = true

@@ -70,6 +70,7 @@ struct Counters {
     var complete = 0, idle = 0, other = 0
     var audioFrames = 0, audioCb = 0, audioZeroCb = 0, audioDropped = 0
     var shmSkipped = 0
+    var unchanged = 0
 }
 
 final class Stats {

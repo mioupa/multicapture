@@ -12,6 +12,7 @@ final class ShmRing {
     private let totalSize: Int
     private let plane0Bytes: Int
     private let plane1Bytes: Int
+    private var lastSeq: UInt64 = 0
 
     init(path: String, width: Int, height: Int) throws {
         self.width = width; self.height = height
@@ -45,6 +46,16 @@ final class ShmRing {
         OSMemoryBarrier()
     }
 
+    /// 直前に書いたコマと画素がまったく同じか。違う行が見つかった時点で打ち切る。
+    func sameAsLatest(plane0: UnsafeRawPointer, stride0: Int, plane1: UnsafeRawPointer, stride1: Int) -> Bool {
+        guard lastSeq > 0 else { return false }
+        let d0 = base + ShmRing.headerSize + Int(lastSeq % UInt64(ShmRing.slotCount)) * slotSize + ShmRing.headerSize
+        for y in 0..<height where memcmp(d0 + y * width, plane0 + y * stride0, width) != 0 { return false }
+        let d1 = d0 + plane0Bytes
+        for y in 0..<((height + 1) / 2) where memcmp(d1 + y * width, plane1 + y * stride1, width) != 0 { return false }
+        return true
+    }
+
     /// stride はソース側の bytesPerRow。plane0_off / plane1_off はスロット先頭からのバイト数。
     func write(seq: UInt64, pts: Double, plane0: UnsafeRawPointer, stride0: Int, plane1: UnsafeRawPointer, stride1: Int) {
         let slot = base + ShmRing.headerSize + Int(seq % UInt64(ShmRing.slotCount)) * slotSize
@@ -74,6 +85,7 @@ final class ShmRing {
         OSMemoryBarrier()
         base.storeBytes(of: seq, toByteOffset: 40, as: UInt64.self)
         OSMemoryBarrier()
+        lastSeq = seq
     }
 
     func close() {

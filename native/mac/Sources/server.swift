@@ -51,7 +51,7 @@ final class Server {
         emit("stats", [
             "complete": c.complete, "idle": c.idle, "other": c.other,
             "audio_frames": c.audioFrames, "audio_zero": c.audioCb > 0 && c.audioZeroCb == c.audioCb,
-            "shm_skipped": c.shmSkipped, "audio_dropped": c.audioDropped,
+            "shm_skipped": c.shmSkipped, "unchanged": c.unchanged, "audio_dropped": c.audioDropped,
         ])
     }
 
