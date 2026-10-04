@@ -2,15 +2,16 @@ import os
 import shutil
 import subprocess
 
+from . import platform as osp
 from .config import app_dir
-
-CREATE_NO_WINDOW = 0x08000000
 
 ENCODERS = {
     "h264_nvenc": ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"],
     "h264_amf": ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", "21", "-qp_p", "23"],
     "h264_qsv": ["-c:v", "h264_qsv", "-preset", "medium", "-global_quality", "23"],
     "libx264": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"],
+    # provisional; quality is tuned in Phase 2 (§5.7)
+    "h264_videotoolbox": ["-c:v", "h264_videotoolbox", "-allow_sw", "0", "-q:v", "60"],
 }
 
 FORCED_IDR = {
@@ -24,6 +25,7 @@ ENCODER_LABELS = {
     "h264_amf": "AMD AMF",
     "h264_qsv": "Intel Quick Sync",
     "libx264": "CPU (x264)",
+    "h264_videotoolbox": "Apple VideoToolbox",
 }
 
 _detected = None
@@ -32,12 +34,7 @@ SIG_SIZE = (64, 36)
 
 
 def find_ffmpeg():
-    base = app_dir()
-    for candidate in (
-        os.path.join(base, "ffmpeg", "ffmpeg.exe"),
-        os.path.join(base, "ffmpeg.exe"),
-        os.path.join(base, "_internal", "ffmpeg.exe"),
-    ):
+    for candidate in osp.ffmpeg_candidates(app_dir()):
         if os.path.isfile(candidate):
             return candidate
     return shutil.which("ffmpeg")
@@ -50,7 +47,7 @@ def _works(ffmpeg, encoder):
         "-frames:v", "5", "-pix_fmt", "yuv420p", *ENCODERS[encoder], "-f", "null", "-",
     ]
     try:
-        return subprocess.run(cmd, capture_output=True, timeout=20, creationflags=CREATE_NO_WINDOW).returncode == 0
+        return subprocess.run(cmd, capture_output=True, timeout=20, **osp.popen_kwargs()).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -60,7 +57,7 @@ def detect_encoder(ffmpeg, preference="auto"):
     if preference in ENCODERS and preference != "auto":
         return preference
     if _detected is None:
-        _detected = next((e for e in ("h264_nvenc", "h264_amf", "h264_qsv") if _works(ffmpeg, e)), "libx264")
+        _detected = next((e for e in osp.HW_ENCODERS if _works(ffmpeg, e)), "libx264")
     return _detected
 
 
@@ -71,7 +68,7 @@ def _list_line(path):
 def _run(cmd, log):
     log.write(" ".join(cmd) + "\n")
     log.flush()
-    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log, creationflags=CREATE_NO_WINDOW).returncode
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log, **osp.popen_kwargs()).returncode
 
 
 def concat(ffmpeg, parts, output, log_path):
@@ -131,7 +128,7 @@ def decode_gray(ffmpeg, path, start, count=None, size=SIG_SIZE):
     if count:
         cmd += ["-frames:v", str(count)]
     cmd += ["-vf", f"scale={w}:{h}:flags=area,format=gray", "-f", "rawvideo", "-"]
-    data = subprocess.run(cmd, capture_output=True, creationflags=CREATE_NO_WINDOW).stdout
+    data = subprocess.run(cmd, capture_output=True, **osp.popen_kwargs()).stdout
     n = w * h
     return [data[i:i + n] for i in range(0, len(data) - n + 1, n)]
 
@@ -157,8 +154,17 @@ def find_join(ffmpeg, part_a, duration_a, part_b, at_b, fps, nominal_a, window=1
     return (first + pick) / fps
 
 
+def video_encode_args(encoder, fps, no_bframes=False, key_frames=None):
+    """Output pixel format, encoder options, GOP and key frames: the video-encoding part shared by
+    recordings (build_command) and the capacity measurement (capacity.py)."""
+    return [
+        "-pix_fmt", "yuv420p", *ENCODERS[encoder], "-g", str(fps * 2), *(["-bf", "0"] if no_bframes else []),
+        *(["-force_key_frames", ",".join(f"{t:.6f}" for t in key_frames), *FORCED_IDR.get(encoder, [])] if key_frames else []),
+    ]
+
+
 def build_command(ffmpeg, width, height, fps, audio_pipe, sample_rate, channels, out_w, out_h, encoder, output, trim_start=0.0,
-                  no_bframes=False, key_frames=None):
+                  no_bframes=False, key_frames=None, pix_fmt="bgra"):
     video_filter = []
     if (width, height) != (out_w, out_h):
         video_filter = [
@@ -169,7 +175,7 @@ def build_command(ffmpeg, width, height, fps, audio_pipe, sample_rate, channels,
     return [
         ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
         "-thread_queue_size", "16", "-probesize", "32", "-analyzeduration", "0",
-        "-f", "rawvideo", "-pix_fmt", "bgra", "-video_size", f"{width}x{height}", "-framerate", str(fps),
+        "-f", "rawvideo", "-pix_fmt", pix_fmt, "-video_size", f"{width}x{height}", "-framerate", str(fps),
         "-i", "pipe:0",
         "-thread_queue_size", "1024", "-probesize", "32", "-analyzeduration", "0",
         "-f", "s16le", "-ar", str(sample_rate), "-ch_layout", "stereo" if channels == 2 else "mono",
@@ -177,8 +183,7 @@ def build_command(ffmpeg, width, height, fps, audio_pipe, sample_rate, channels,
         "-map", "0:v:0", "-map", "1:a:0",
         *(["-ss", f"{trim_start:.3f}"] if trim_start > 0 else []),
         *video_filter,
-        "-pix_fmt", "yuv420p", *ENCODERS[encoder], "-g", str(fps * 2), *(["-bf", "0"] if no_bframes else []),
-        *(["-force_key_frames", ",".join(f"{t:.6f}" for t in key_frames), *FORCED_IDR.get(encoder, [])] if key_frames else []),
+        *video_encode_args(encoder, fps, no_bframes, key_frames),
         "-c:a", "aac", "-b:a", "192k",
         *(["-movflags", "+frag_keyframe+empty_moov+default_base_moof"] if output.lower().endswith(".mp4") else []),
         output,

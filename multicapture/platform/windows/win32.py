@@ -193,46 +193,6 @@ def primary_screen_size():
     return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
 
-class PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [
-        ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
-        ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
-        ("szExeFile", ctypes.c_wchar * 260),
-    ]
-
-
-kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-
-
-def process_tree(root_pid):
-    snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)
-    if not snap or snap == wintypes.HANDLE(-1).value:
-        return {root_pid}
-    parents = {}
-    try:
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(entry)
-        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
-        while ok:
-            parents[entry.th32ProcessID] = entry.th32ParentProcessID
-            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
-    finally:
-        kernel32.CloseHandle(snap)
-    tree = {root_pid}
-    changed = True
-    while changed:
-        changed = False
-        for pid, ppid in parents.items():
-            if ppid in tree and pid not in tree and pid != ppid:
-                tree.add(pid)
-                changed = True
-    return tree
-
-
 class REASON_CONTEXT(ctypes.Structure):
     _fields_ = [
         ("Version", ctypes.c_ulong),

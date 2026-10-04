@@ -181,9 +181,6 @@ class ProcessLoopback:
                 break
         return chunks
 
-    def read(self):
-        return b"".join(payload for payload, _ in self.read_timed())
-
     def close(self):
         if self.client.value:
             method(self.client, 11, HRESULT)()
