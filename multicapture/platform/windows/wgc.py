@@ -294,9 +294,6 @@ class WindowCapture:
     def write_slot(self, sink, slot):
         self._write_texture(sink, self.ring[slot])
 
-    def write_to(self, sink):
-        self._write_texture(sink, self.ring[self.head])
-
     def _write_texture(self, sink, tex):
         mapped = self.device.map(tex)
         try:

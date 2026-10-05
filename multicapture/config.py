@@ -4,6 +4,8 @@ import sys
 import uuid
 from dataclasses import asdict, dataclass, field
 
+from . import platform as osp
+
 
 def app_dir():
     if getattr(sys, "frozen", False):
@@ -11,29 +13,12 @@ def app_dir():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _writable(path):
-    try:
-        os.makedirs(path, exist_ok=True)
-        probe = os.path.join(path, ".write_test")
-        with open(probe, "w") as f:
-            f.write("ok")
-        os.remove(probe)
-        return True
-    except OSError:
-        return False
-
-
 def data_dir():
-    portable = os.path.join(app_dir(), "data")
-    if _writable(portable):
-        return portable
-    fallback = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MultiCapture")
-    os.makedirs(fallback, exist_ok=True)
-    return fallback
+    return osp.default_data_dir(app_dir())
 
 
 def default_output_dir():
-    return os.path.join(os.path.expanduser("~"), "Videos", "MultiCapture")
+    return osp.default_output_dir()
 
 
 def new_slot_id():
@@ -53,7 +38,7 @@ class Slot:
 @dataclass
 class Settings:
     output_dir: str = field(default_factory=default_output_dir)
-    browser: str = "edge"
+    browser: str = osp.DEFAULT_BROWSER
     fps: int = 30
     encoder: str = "auto"
     keep_display_on: bool = False
@@ -86,7 +71,8 @@ class Settings:
             if isinstance(raw.get(key), bool):
                 setattr(settings, key, raw[key])
         if isinstance(raw.get("split_count"), int):
-            settings.split_count = max(1, min(8, raw["split_count"]))
+            from .capacity import ABS_MAX
+            settings.split_count = max(1, min(ABS_MAX, raw["split_count"]))
         if isinstance(raw.get("fps"), int):
             settings.fps = max(1, min(60, raw["fps"]))
         if isinstance(raw.get("slots"), list):
@@ -115,7 +101,7 @@ def login_profile_dir():
 
 
 def work_dir():
-    path = os.path.join(data_dir(), "work")
+    path = os.path.join(data_dir(), osp.WORK_DIR_NAME)
     os.makedirs(path, exist_ok=True)
     return path
 

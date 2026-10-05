@@ -7,14 +7,18 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, ffmpeg, win32
+from . import __version__, capacity, ffmpeg
+from . import platform as osp
 from .browser import BROWSER_LABELS, BrowserWindow, available_browsers
-from .config import Settings, Slot, profile_dir
+from .config import Settings, Slot, data_dir, log_dir, profile_dir
 from .recorder import SlotRecorder
 from .splitjob import LoginBrowser, SplitJob, cleanup_stale_work, fmt_time, restore_speakers_if_needed
 
 SIZE_PRESETS = ["1920x1080", "1280x720", "2560x1440", "3840x2160", "1080x1920", "1024x768"]
-ENCODER_CHOICES = [("auto", "自動 (GPU優先)"), ("h264_nvenc", "NVIDIA NVENC"), ("h264_amf", "AMD AMF"), ("h264_qsv", "Intel Quick Sync"), ("libx264", "CPU (x264)")]
+if osp.NAME == "mac":
+    ENCODER_CHOICES = [("auto", "自動 (GPU優先)"), ("h264_videotoolbox", "Apple VideoToolbox"), ("libx264", "CPU (x264)")]
+else:
+    ENCODER_CHOICES = [("auto", "自動 (GPU優先)"), ("h264_nvenc", "NVIDIA NVENC"), ("h264_amf", "AMD AMF"), ("h264_qsv", "Intel Quick Sync"), ("libx264", "CPU (x264)")]
 CASCADE_STEP = 48
 
 
@@ -27,6 +31,11 @@ def parse_size(text):
     except ValueError:
         pass
     return None
+
+
+def stats_text(stats):
+    return (f"取りこぼし: 捨てたコマ {stats['dropped_frames']}／リングあふれ {stats['ring_overflow']}／"
+            f"音声の欠け {stats['audio_dropped']}")
 
 
 class SlotDialog(tk.Toplevel):
@@ -89,24 +98,33 @@ class SlotDialog(tk.Toplevel):
 
 class App:
     def __init__(self):
-        win32.set_dpi_awareness()
+        osp.set_dpi_awareness()
         restore_speakers_if_needed()
+        if osp.NAME == "mac":
+            try:
+                osp.cleanup_leftovers(data_dir())   # browsers / helpers / caffeinate left by a crashed run
+            except Exception:
+                pass
         cleanup_stale_work()
         self.settings = Settings.load()
+        self.capture_hint = None
         self.browsers_found = available_browsers()
         if self.settings.browser not in self.browsers_found and self.browsers_found:
             self.settings.browser = next(iter(self.browsers_found))
         self.ffmpeg_path = ffmpeg.find_ffmpeg()
         self.encoder = None
+        self.measurement = None
+        self.measure_cancel = threading.Event()
         self.browsers = {}
         self.recorders = []
         self.events = queue.Queue()
         self.busy = False
-        self.keep_awake = win32.KeepAwake("MultiCapture: 録画中のためスリープを抑止しています")
+        self.keep_awake = osp.KeepAwake("MultiCapture: 録画中のためスリープを抑止しています")
         self.login = None
         self.split_job = None
         self.split_started_at = None
         self.auto_duration = None
+        self.unattended = False
         self.stop_at = None
         self.exit_when_idle = False
 
@@ -118,23 +136,28 @@ class App:
         self._refresh_tree()
         self._update_buttons()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if osp.NAME == "mac":
+            # Cmd+Q goes through the same close path (recording confirmation, browser cleanup)
+            self.root.createcommand("::tk::mac::Quit", self._on_close)
+            threading.Thread(target=self._check_mac_permissions, daemon=True).start()
         self.root.after(100, self._poll)
         if self.ffmpeg_path:
-            threading.Thread(target=self._detect_encoder, daemon=True).start()
+            threading.Thread(target=self._detect_encoder, args=(self._encoder_pref(),), daemon=True).start()
 
     def schedule(self, start, duration):
         self.auto_duration = duration
+        self.unattended = bool(start)
         if start:
             self.notebook.select(self.dash_tab)
             self.root.after(800, self._start_recording)
 
     def _style(self):
         style = ttk.Style(self.root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        self.root.option_add("*Font", ("Yu Gothic UI", 10))
+        if osp.TK_THEME in style.theme_names():
+            style.theme_use(osp.TK_THEME)
+        self.root.option_add("*Font", (osp.UI_FONT, 10))
         style.configure("Treeview", rowheight=26)
-        style.configure("Accent.TButton", font=("Yu Gothic UI", 10, "bold"))
+        style.configure("Accent.TButton", font=(osp.UI_FONT, 10, "bold"))
         style.configure("Hint.TLabel", foreground="#555")
 
     def _build(self):
@@ -162,13 +185,22 @@ class App:
         ttk.Label(top, text="エンコーダ").grid(row=1, column=4, sticky="e", pady=(8, 0))
         labels = dict(ENCODER_CHOICES)
         self.encoder_var = tk.StringVar(value=labels.get(self.settings.encoder, labels["auto"]))
-        ttk.Combobox(top, textvariable=self.encoder_var, state="readonly", width=16, values=list(labels.values())).grid(
-            row=1, column=5, sticky="w", padx=6, pady=(8, 0)
-        )
+        enc_frame = ttk.Frame(top)
+        enc_frame.grid(row=1, column=5, sticky="w", padx=6, pady=(8, 0))
+        enc_combo = ttk.Combobox(enc_frame, textvariable=self.encoder_var, state="readonly", width=16, values=list(labels.values()))
+        enc_combo.pack(side="left")
+        enc_combo.bind("<<ComboboxSelected>>", self._on_encoder_changed)
+        self.remeasure_btn = ttk.Button(enc_frame, text="再計測", command=self._remeasure, width=7)
+        self.remeasure_btn.pack(side="left", padx=(6, 0))
         self.keep_display_var = tk.BooleanVar(value=self.settings.keep_display_on)
-        ttk.Checkbutton(top, text="録画中は画面をオフにしない", variable=self.keep_display_var).grid(
-            row=1, column=6, columnspan=2, sticky="w", padx=(10, 0), pady=(8, 0)
-        )
+        keep_display = ttk.Checkbutton(top, text="録画中は画面をオフにしない", variable=self.keep_display_var)
+        keep_display.grid(row=1, column=6, columnspan=2, sticky="w", padx=(10, 0), pady=(8, 0))
+        if osp.DISPLAY_ALWAYS_ON:
+            self.keep_display_var.set(True)
+            keep_display.state(["disabled"])
+            ttk.Label(top, text="macでは録画中は常に画面をオフにしません（画面が消えると録画が止まるため）", style="Hint.TLabel").grid(
+                row=2, column=1, columnspan=7, sticky="w", padx=6, pady=(2, 0)
+            )
         top.columnconfigure(1, weight=1)
 
         self.notebook = ttk.Notebook(root)
@@ -193,7 +225,10 @@ class App:
 
         ttk.Label(form, text="同時に録画する数").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.split_count_var = tk.IntVar(value=self.settings.split_count)
-        ttk.Spinbox(form, from_=1, to=8, textvariable=self.split_count_var, width=5).grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
+        self.split_count_spin = ttk.Spinbox(form, from_=1, to=capacity.ABS_MAX, textvariable=self.split_count_var, width=5)
+        self.split_count_spin.grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
+        self.limit_var = tk.StringVar(value="")
+        ttk.Label(form, textvariable=self.limit_var, style="Hint.TLabel").grid(row=2, column=1, columnspan=5, sticky="w", padx=6)
         ttk.Label(form, text="録画サイズ").grid(row=1, column=2, sticky="e", pady=(8, 0))
         self.split_size_var = tk.StringVar(value=self.settings.split_size)
         ttk.Combobox(form, textvariable=self.split_size_var, values=SIZE_PRESETS[:4], width=12).grid(row=1, column=3, sticky="w", padx=6, pady=(8, 0))
@@ -202,6 +237,9 @@ class App:
         self.mute_var = tk.BooleanVar(value=self.settings.mute_speakers)
         ttk.Checkbutton(form, text="録画中はPCの音をミュート（録音はされます）", variable=self.mute_var).grid(row=1, column=5, sticky="w", padx=(10, 0), pady=(8, 0))
         form.columnconfigure(5, weight=1)
+        self.split_size_var.trace_add("write", lambda *a: self._refresh_limit())
+        self.fps_var.trace_add("write", lambda *a: self._refresh_limit())
+        self._refresh_limit()
 
         ttk.Label(
             tab, style="Hint.TLabel", wraplength=800, justify="left",
@@ -268,24 +306,117 @@ class App:
         self.rec_btn = ttk.Button(bottom, text="● 録画開始", style="Accent.TButton", command=self._start_recording)
         self.rec_btn.pack(side="right", padx=6)
 
+    def _check_mac_permissions(self):
+        """Background: check screen/audio capture permissions; guide the user and ask for them when missing."""
+        app_name = "MultiCapture" if getattr(sys, "frozen", False) else "MultiCapture Capture"
+        guide = ("画面収録とシステムオーディオ録音の許可が必要です。\n"
+                 "システム設定 →「プライバシーとセキュリティ」→「画面収録とシステムオーディオ録音」を開き、"
+                 f"「{app_name}」をオンにしてください。\n（許可を変えたあとは、アプリを再起動してください）")
+        try:
+            perms = osp.check_permissions()
+            if osp.permissions_ok(perms):
+                return
+            self.events.put(("info", "⚠ 画面収録とシステムオーディオ録音の許可が必要です（システム設定 →「プライバシーとセキュリティ」）"))
+            perms = osp.request_permissions()
+            if not osp.permissions_ok(perms):
+                self.events.put(("notice", guide))
+        except Exception as exc:
+            self.events.put(("info", f"⚠ 録画用の補助プログラムを確認できませんでした: {str(exc)[:150]}"))
+
     def _set_info(self, extra=None):
         parts = []
         if not self.ffmpeg_path:
-            parts.append("⚠ ffmpeg.exe が見つかりません（アプリと同じフォルダに置いてください）")
+            parts.append(f"⚠ {osp.FFMPEG_NAME} が見つかりません（アプリと同じフォルダに置いてください）")
         elif self.encoder:
             parts.append(f"エンコーダ: {ffmpeg.ENCODER_LABELS[self.encoder]}")
         else:
             parts.append("エンコーダを確認中…")
         if not self.browsers_found:
-            parts.append("⚠ Edge / Chrome が見つかりません")
-        parts.append("録画中のウィンドウは重なっていても裏に隠れていてもOK（最小化のみ不可）")
+            parts.append("⚠ " + " / ".join(("Edge", "Chrome") if osp.DEFAULT_BROWSER == "edge" else ("Chrome", "Edge")) + " が見つかりません")
+        parts.append(osp.OVERLAP_HINT)
         if extra:
             parts.insert(0, extra)
         self.info_var.set("   |   ".join(parts))
 
-    def _detect_encoder(self):
-        encoder = ffmpeg.detect_encoder(self.ffmpeg_path, self._encoder_pref())
-        self.events.put(("encoder", encoder))
+    def _detect_encoder(self, preference):
+        self._emit_encoder(ffmpeg.detect_encoder(self.ffmpeg_path, preference))
+
+    def _emit_encoder(self, encoder):
+        """Called from worker threads: also loads the cached measurement (may run `ffmpeg -version`)."""
+        self.events.put(("encoder", (encoder, capacity.load(self.ffmpeg_path, encoder))))
+
+    def _on_encoder_changed(self, event=None):
+        if self.ffmpeg_path and not self.busy and not self._recording():
+            threading.Thread(target=self._detect_encoder, args=(self._encoder_pref(),), daemon=True).start()
+
+    def _split_size_fps(self):
+        size = parse_size(self.split_size_var.get()) or (1920, 1080)
+        try:
+            fps = max(5, min(60, int(self.fps_var.get())))
+        except (tk.TclError, ValueError):
+            fps = self.settings.fps
+        return size, fps
+
+    def _limit(self):
+        """(limit, reason) from the cached measurement, or None when there is none yet."""
+        if self.measurement is None:
+            return None
+        (w, h), fps = self._split_size_fps()
+        return capacity.limit_for(self.measurement, w, h, fps, osp.physical_memory_bytes())
+
+    def _refresh_limit(self):
+        limit = self._limit()
+        if limit is None:
+            self.split_count_spin.config(to=capacity.ABS_MAX)
+            self.limit_var.set("上限は初回の録画前に計測します")
+            return
+        self.split_count_spin.config(to=limit[0])
+        self.limit_var.set(f"上限 {limit[0]}（{limit[1]}）")
+        try:
+            if int(self.split_count_var.get()) > limit[0]:
+                self.split_count_var.set(limit[0])
+        except (tk.TclError, ValueError):
+            pass
+
+    def _measure_now(self, encoder):
+        """Measure and cache in the calling worker thread, reporting progress through the events queue."""
+        def progress(fraction, text):
+            self.events.put(("measure", (fraction, text)))
+
+        meas = capacity.measure(self.ffmpeg_path, encoder, capacity.default_pix_fmt(), progress, self.measure_cancel)
+        capacity.save(meas, self.ffmpeg_path)
+        self.events.put(("measured", meas))
+        return meas
+
+    def _ensure_measurement(self, encoder):
+        """The cached or fresh measurement, or None when it fails: a failed measurement never blocks recording."""
+        meas = capacity.load(self.ffmpeg_path, encoder)
+        if meas is None:
+            try:
+                meas = self._measure_now(encoder)
+            except capacity.MeasureCancelled:
+                raise
+            except Exception as exc:
+                self.events.put(("info", f"上限の計測に失敗したため、従来の上限 {capacity.FALLBACK_LIMIT} で録画します"
+                                         f"（詳細: data/logs/capacity.log / {str(exc)[:120]}）"))
+                return None
+        return meas
+
+    def _remeasure(self):
+        if not self.ffmpeg_path or not self.encoder or self.busy or self._recording():
+            return
+
+        def work():
+            try:
+                self._measure_now(self.encoder)
+            except capacity.MeasureCancelled:
+                return
+            except Exception as exc:
+                self.events.put(("info", f"計測に失敗しました: {str(exc)[:200]}（詳細: data/logs/capacity.log）"))
+                return
+            self.events.put(("info", "計測が終わりました"))
+
+        self._run_background(work)
 
     def _encoder_pref(self):
         label = self.encoder_var.get()
@@ -307,7 +438,7 @@ class App:
         s.keep_display_on = bool(self.keep_display_var.get())
         s.split_url = self.split_url_var.get().strip()
         try:
-            s.split_count = max(1, min(8, int(self.split_count_var.get())))
+            s.split_count = max(1, min(capacity.ABS_MAX, int(self.split_count_var.get())))
         except (tk.TclError, ValueError):
             s.split_count = 4
         s.split_size = self.split_size_var.get().strip() or "1920x1080"
@@ -363,6 +494,7 @@ class App:
         for b in self.edit_buttons:
             b.state([state(idle and not any_browser)])
         self.split_start_btn.state([state(idle and ready)])
+        self.remeasure_btn.state([state(idle and bool(self.ffmpeg_path) and bool(self.encoder))])
         self.split_cancel_btn.state([state(split)])
         self.login_btn.state([state(idle and bool(self.browsers_found) and not self._login_open())])
         self.login_state.config(text="ログイン用ブラウザが開いています。ログインが済んだら「● 高速録画開始」を押してください" if self._login_open() else "")
@@ -376,7 +508,7 @@ class App:
     def _open_output(self):
         path = self.output_var.get()
         os.makedirs(path, exist_ok=True)
-        os.startfile(path)
+        osp.open_folder(path)
 
     def _on_click(self, event):
         if self._recording() or self.busy or any(self.browsers.values()):
@@ -392,7 +524,7 @@ class App:
             self._edit()
 
     def _dialog(self, slot):
-        dlg = SlotDialog(self.root, slot, win32.primary_screen_size())
+        dlg = SlotDialog(self.root, slot, osp.primary_screen_size())
         self.root.wait_window(dlg)
         return dlg.result
 
@@ -503,7 +635,20 @@ class App:
         def work():
             self._launch_missing(indices)
             encoder = ffmpeg.detect_encoder(self.ffmpeg_path, self.settings.encoder)
-            self.events.put(("encoder", encoder))
+            self._emit_encoder(encoder)
+            meas = self._ensure_measurement(encoder)
+            slots = [self.settings.slots[i] for i in indices]
+            load = capacity.page_load(meas, slots, self.settings.fps) if meas is not None else 0
+            if load > 1:
+                need = load * capacity.SAFETY * meas.pixels_per_sec
+                self.events.put(("warn", (
+                    "録画の負荷が高い構成です",
+                    f"選んだ{len(slots)}ページを{self.settings.fps}fpsで録画するには、1秒あたり約{need / 1e6:.0f}メガピクセルの"
+                    f"エンコードが必要です。\nこのPCで安定して処理できる量の目安は約{capacity.SAFETY * meas.pixels_per_sec / 1e6:.0f}メガピクセル"
+                    f"（計測値の{capacity.SAFETY * 100:.0f}%）で、{load * 100:.0f}%にあたります。\n\n"
+                    "コマの取りこぼしが起きる可能性があります。ページ数・録画サイズ・FPSを減らすことをお勧めします。\n"
+                    "このまま録画を開始します。",
+                )))
             recorders = []
             for i in indices:
                 b = self.browsers.get(i)
@@ -518,8 +663,27 @@ class App:
             for r in recorders:
                 r.start()
             self.events.put(("started", None))
+            if capacity.SESSION_ERROR_MARKERS.get(encoder):
+                threading.Thread(target=self._watch_session_failures, args=(recorders, encoder), daemon=True).start()
 
         self._run_background(work)
+
+    def _watch_session_failures(self, recorders, encoder):
+        """Right after the start: did an encoder fail to open because of the session limit?"""
+        end = time.monotonic() + 6
+        while time.monotonic() < end and any(r.running for r in recorders):
+            time.sleep(0.5)
+            if any(not r.running for r in recorders):
+                break
+        time.sleep(1.0)
+        broken = [r for r in recorders if r.error and capacity.log_has_session_error(os.path.join(log_dir(), r.log_name), encoder)]
+        if not broken:
+            return
+        running = len([r for r in recorders if r.running and not r.error])
+        meas = capacity.note_session_failure(self.ffmpeg_path, encoder, running)
+        self.events.put(("measured", meas))
+        self.events.put(("error", f"エンコーダの同時セッション数の上限に達しました。録画できているのは{running}件です。"
+                                  f"次回からは「同時に録画する数」（ページ数）を{max(1, running)}以下にしてください。"))
 
     def _stop_recording(self):
         recorders = list(self.recorders)
@@ -530,7 +694,8 @@ class App:
             for r in recorders:
                 r.join(90)
             saved = [r.output_path for r in recorders if r.output_path and not r.error]
-            self.events.put(("saved", saved))
+            totals = {k: sum(getattr(r, k) for r in recorders) for k in ("dropped_frames", "ring_overflow", "audio_dropped")}
+            self.events.put(("saved", (saved, totals)))
 
         self._run_background(work)
 
@@ -581,9 +746,23 @@ class App:
                 self.login.close()
             self.login = None
             encoder = ffmpeg.detect_encoder(self.ffmpeg_path, self.settings.encoder)
-            self.events.put(("encoder", encoder))
+            self._emit_encoder(encoder)
+            meas = self._ensure_measurement(encoder)
+            count = self.settings.split_count
+            if meas is None:
+                if count > capacity.FALLBACK_LIMIT:
+                    self.events.put(("info", f"上限の計測に失敗したため、同時に録画する数を{count}から{capacity.FALLBACK_LIMIT}に減らして録画します"
+                                             "（詳細: data/logs/capacity.log）"))
+                    count = capacity.FALLBACK_LIMIT
+                    self.events.put(("split_count", count))
+            else:
+                limit, reason = capacity.limit_for(meas, size[0], size[1], self.settings.fps, osp.physical_memory_bytes())
+                if count > limit:
+                    self.events.put(("notice", f"同時に録画する数を{count}から{limit}に減らして録画します（上限 {limit}：{reason}）。"))
+                    count = limit
+                    self.events.put(("split_count", count))
             job = SplitJob(
-                url, self.settings.split_count, size[0], size[1], self.settings.split_pin_video,
+                url, count, size[0], size[1], self.settings.split_pin_video,
                 self.settings.output_dir, self.settings, exe, self.ffmpeg_path, encoder,
                 self.settings.mute_speakers, cookies,
                 lambda kind, payload: self.events.put(("split", (kind, payload))),
@@ -623,8 +802,12 @@ class App:
             self.split_progress["value"] = 1000
             self.split_status_var.set(f"保存しました: {payload}")
             self._set_info("保存しました")
-            if messagebox.askyesno("MultiCapture", f"録画が完了しました。\n\n{payload}\n\n保存先フォルダを開きますか？"):
-                os.startfile(os.path.dirname(payload))
+            if self.split_job:
+                stats_line = "\n" + stats_text(self.split_job.stats) + "\n"
+            else:
+                stats_line = ""
+            if messagebox.askyesno("MultiCapture", f"録画が完了しました。\n\n{payload}\n{stats_line}\n保存先フォルダを開きますか？"):
+                osp.open_folder(os.path.dirname(payload))
         elif kind == "error":
             self.split_status_var.set(f"エラー: {payload}")
             if payload != "中止しました":
@@ -639,21 +822,55 @@ class App:
                 elif kind == "split":
                     self._on_split_event(*payload)
                 elif kind == "encoder":
-                    self.encoder = payload
+                    self.encoder, self.measurement = payload
                     self._set_info()
+                    self._refresh_limit()
+                elif kind == "measure":
+                    fraction, text = payload
+                    text = f"{text} {fraction * 100:.0f}%"
+                    self.split_status_var.set(text)
+                    self._set_info(text)
+                elif kind == "measured":
+                    if payload is not None:
+                        self.measurement = payload
+                        self._refresh_limit()
+                elif kind == "info":
+                    self._set_info(payload)
+                elif kind == "notice":
+                    if self.unattended:
+                        self._set_info(payload)
+                    else:
+                        messagebox.showinfo("MultiCapture", payload)
+                elif kind == "warn":
+                    # A modal box would stall this loop, which also handles the scheduled auto-stop.
+                    if self.unattended:
+                        self._set_info(f"⚠ {payload[0]}（コマの取りこぼしが起きる可能性があります）")
+                    else:
+                        messagebox.showwarning(*payload)
+                elif kind == "split_count":
+                    self.split_count_var.set(payload)
                 elif kind == "error":
                     messagebox.showerror("MultiCapture", payload)
                 elif kind == "idle":
                     self.busy = False
                 elif kind == "saved":
-                    if payload:
-                        self._set_info(f"{len(payload)} 件保存しました")
+                    saved, totals = payload
+                    if saved:
+                        text = f"{len(saved)} 件保存しました"
+                        if any(totals.values()):
+                            text += "（" + stats_text(totals) + "）"
+                        self._set_info(text)
                 elif kind == "started":
                     self.keep_awake.acquire(keep_display=self.settings.keep_display_on)
                     if self.auto_duration:
                         self.stop_at = time.monotonic() + self.auto_duration
         except queue.Empty:
             pass
+        if osp.NAME == "mac":
+            hint = osp.capture_hint(self.settings.fps) if self._recording() else None
+            if hint != self.capture_hint:
+                self.capture_hint = hint
+                self._set_info("⚠ " + hint if hint else None)
         if not self._recording() and not self.busy:
             self.keep_awake.release()
         if self.stop_at and time.monotonic() >= self.stop_at:
@@ -682,6 +899,7 @@ class App:
                 r.join(90)
             if self.split_job:
                 self.split_job.join(120)
+        self.measure_cancel.set()
         self._collect_settings()
         for b in list(self.browsers.values()):
             if b:
@@ -703,13 +921,20 @@ class App:
 
 
 def main(argv=None):
-    if sys.getwindowsversion().build < 22000:
+    error = osp.check_environment()
+    if error:
         root = tk.Tk()
         root.withdraw()
-        messagebox.showerror("MultiCapture", "このアプリはWindows 11以降が必要です。\n(ブラウザごとの音声取得機能がWindows 10にはありません)")
+        messagebox.showerror("MultiCapture", error)
         root.destroy()
         return 1
     args = sys.argv[1:] if argv is None else argv
+    if not osp.SCHEDULE_SUPPORTED and ("--start" in args or "--duration" in args):
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("MultiCapture", "予約録画（--start / --duration）はmacでは未対応です。通常どおり起動します。")
+        root.destroy()
+        args = [a for a in args if a not in ("--start", "--duration")]
     duration = None
     if "--duration" in args:
         try:

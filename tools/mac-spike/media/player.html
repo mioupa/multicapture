@@ -1,0 +1,62 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>player</title>
+<style>
+html,body{margin:0;padding:0;background:#000;overflow:hidden;cursor:none;width:100%;height:100%}
+video,canvas{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;background:#000}
+</style></head>
+<body>
+<script>
+(function(){
+  var q = new URLSearchParams(location.search);
+  var src = q.get('src'), loop = q.get('loop') !== '0', muted = q.get('muted') === '1';
+  var tone = parseFloat(q.get('tone') || '0'), gain = parseFloat(q.get('gain') || '0.2');
+  var anim = q.get('anim') === '1';
+  if (q.get('label')) document.title = q.get('label');
+  var mc = window.__mc = {raf:0, vfc:0, presented:0, mediaTime:0, dropped:0, total:0,
+                          audioState:'none', playing:false, errors:[], anim:anim, t0:performance.now()};
+  window.addEventListener('error', function(e){ mc.errors.push(String(e.message)); });
+  function rafLoop(){ mc.raf++; requestAnimationFrame(rafLoop); }
+  requestAnimationFrame(rafLoop);
+
+  var v = null, cv = null;
+  if (anim) {
+    cv = document.createElement('canvas'); cv.width = 640; cv.height = 360;
+    document.body.appendChild(cv);
+    var g = cv.getContext('2d'), n = 0;
+    (function draw(){ n++; g.fillStyle = 'hsl(' + (n*7%360) + ',60%,25%)'; g.fillRect(0,0,640,360);
+      g.fillStyle = '#fff'; g.fillRect((n*5)%600, 150, 40, 40); requestAnimationFrame(draw); })();
+  } else if (src) {
+    v = document.createElement('video');
+    v.src = src; v.loop = loop; v.muted = muted; v.playsInline = true; v.preload = 'auto';
+    document.body.appendChild(v);
+    v.addEventListener('error', function(){ mc.errors.push('video error ' + (v.error && v.error.code)); });
+    function vf(now, md){
+      mc.vfc++; mc.presented = md.presentedFrames; mc.mediaTime = md.mediaTime;
+      v.requestVideoFrameCallback(vf);
+    }
+    v.requestVideoFrameCallback(vf);
+    function tryPlay(){
+      if (!v.paused) { mc.playing = true; return; }
+      var p = v.play(); if (p && p.catch) p.catch(function(e){ mc.errors.push('play: ' + e.name); });
+    }
+    tryPlay(); setInterval(tryPlay, 500);
+    v.addEventListener('playing', function(){ mc.playing = true; });
+    v.addEventListener('pause', function(){ mc.playing = false; });
+    setInterval(function(){
+      var qlt = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+      if (qlt) { mc.dropped = qlt.droppedVideoFrames; mc.total = qlt.totalVideoFrames; }
+    }, 250);
+  }
+  if (tone > 0) {
+    var ac = new (window.AudioContext || window.webkitAudioContext)();
+    var osc = ac.createOscillator(), gn = ac.createGain();
+    osc.type = 'sine'; osc.frequency.value = tone; gn.gain.value = gain;
+    osc.connect(gn); gn.connect(ac.destination); osc.start();
+    mc.audioState = ac.state;
+    ac.onstatechange = function(){ mc.audioState = ac.state; };
+    function resume(){ if (ac.state !== 'running') ac.resume().catch(function(){}); mc.audioState = ac.state; }
+    resume(); setInterval(resume, 500);
+  }
+})();
+</script>
+</body></html>

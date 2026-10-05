@@ -6,8 +6,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from . import ffmpeg, win32
-from .audiosession import SpeakerMute
+from . import capacity, ffmpeg
+from . import platform as osp
 from .browser import BrowserWindow, clone_profile
 from .cdp import Browser, CDPError
 from .config import Slot, data_dir, log_dir, login_profile_dir, work_dir
@@ -39,11 +39,7 @@ def speaker_state_path():
 
 
 def restore_speakers_if_needed():
-    if os.path.exists(speaker_state_path()):
-        try:
-            SpeakerMute(speaker_state_path()).restore()
-        except OSError:
-            pass
+    osp.restore_speakers_if_needed(speaker_state_path())
 
 
 def cleanup_stale_work():
@@ -124,8 +120,9 @@ class SplitJob:
         self._recorders = []
         self._lock = threading.Lock()
         self._job_dir = os.path.join(work_dir(), uuid.uuid4().hex[:8])
-        self._muter = SpeakerMute(speaker_state_path())
+        self._muter = osp.SpeakerMute(speaker_state_path())
         self._join_log = []
+        self.stats = {"dropped_frames": 0, "ring_overflow": 0, "audio_dropped": 0}
 
     @property
     def running(self):
@@ -227,6 +224,12 @@ class SplitJob:
                 extra[1].close()
                 extra[0].close(timeout=5)
             prepared = prepared[:n]
+            settle_until = time.monotonic() + osp.BROWSER_SETTLE_SECONDS
+            while time.monotonic() < settle_until:
+                if self.cancel_event.is_set():
+                    raise RuntimeError("中止しました")
+                self._status(f"ブラウザの動作が落ち着くのを待っています（あと{int(settle_until - time.monotonic()) + 1}秒）")
+                time.sleep(0.5)
             self._publish()
             self._emit("started", {"duration": self.duration, "segments": n, "title": title})
             self._status(f"動画の長さ {fmt_time(self.duration)} を {n} 分割して録画しています")
@@ -252,6 +255,9 @@ class SplitJob:
                 raise RuntimeError("中止しました")
             failed = [s for s in self.segments if not s.path]
             if failed:
+                hint = self._session_failure_hint(failed)
+                if hint:
+                    raise RuntimeError(hint)
                 raise RuntimeError(f"区間 {', '.join(str(s.index + 1) for s in failed)} の録画に失敗しました: {failed[0].error}")
 
             self._status("区間をつなげて1本の動画にしています…")
@@ -276,11 +282,23 @@ class SplitJob:
                 except Exception:
                     pass
             time.sleep(1.0)
-            shutil.rmtree(self._job_dir, ignore_errors=True)
+            if not os.environ.get("MULTICAPTURE_KEEP_WORK"):   # keep segment files for diagnosis
+                shutil.rmtree(self._job_dir, ignore_errors=True)
+
+    def _session_failure_hint(self, failed):
+        """When an encoder session limit made segments fail, remember the cap and tell the user the safe count."""
+        broken = [s for s in failed if capacity.log_has_session_error(
+            os.path.join(log_dir(), f"split_part{s.index + 1}.log"), self.encoder)]
+        if not broken:
+            return None
+        running = len(self.segments) - len(broken)
+        capacity.note_session_failure(self.ffmpeg_path, self.encoder, running)
+        return (f"エンコーダの同時セッション数の上限に達しました。「同時に録画する数」を{max(1, running)}以下にして、もう一度お試しください。"
+                f"（区間 {', '.join(str(s.index + 1) for s in broken)} でエンコーダを開けませんでした）")
 
     def _segment_worker(self, seg, prepared):
         window, browser, player, info, title = prepared
-        win32.ensure_mta()
+        osp.thread_init()
         for attempt in range(1, MAX_ATTEMPTS + 1):
             if self.cancel_event.is_set():
                 seg.status = "中止"
@@ -315,6 +333,7 @@ class SplitJob:
                     outpoint = nominal
                 self._join_log.append(f"join {k + 1}->{k + 2}: nominal {nominal:.4f} matched {found} used {outpoint:.4f}")
             points.append((seg.path, inpoint, outpoint))
+        self._join_log.append("stats: " + " ".join(f"{k}={v}" for k, v in self.stats.items()))
         try:
             with open(os.path.join(log_dir(), "split_joins.log"), "w", encoding="utf-8") as f:
                 f.write("\n".join(self._join_log) + "\n")
@@ -363,7 +382,7 @@ class SplitJob:
             seg.index, Slot(f"part{seg.index + 1}", self.url, self.width, self.height), window, self.settings,
             self.ffmpeg_path, self.encoder, lambda i, text: None,
             output_path=part, trim_start=WARMUP_SECONDS, log_name=f"split_part{seg.index + 1}.log",
-            key_frames=[seg.lead] if seg.lead > 0 else None, sequential=True,
+            key_frames=[seg.lead] if seg.lead > 0 else None, sequential=True, mute_audio=self.silence,
         )
         with self._lock:
             self._recorders.append(recorder)
@@ -441,8 +460,9 @@ class SplitJob:
         finally:
             recorder.stop()
             recorder.join(120)
-
             with self._lock:
+                for key in self.stats:
+                    self.stats[key] += getattr(recorder, key)
                 if recorder in self._recorders:
                     self._recorders.remove(recorder)
         if recorder.error:

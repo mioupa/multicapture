@@ -33,6 +33,12 @@ if (-not $FFmpeg) {
     if ($cmd) {
         $item = Get-Item $cmd.Source
         $FFmpeg = if ($item.Target) { $item.Target } else { $item.FullName }
+        # A Scoop shim only works next to its .shim file, so copy the real executable it points to.
+        $shim = [IO.Path]::ChangeExtension($FFmpeg, ".shim")
+        if (Test-Path $shim) {
+            $line = Select-String -Path $shim -Pattern '^\s*path\s*=\s*"?([^"]+?)"?\s*$' | Select-Object -First 1
+            if ($line) { $FFmpeg = $line.Matches[0].Groups[1].Value }
+        }
     }
 }
 if (-not $FFmpeg -or -not (Test-Path $FFmpeg)) {
