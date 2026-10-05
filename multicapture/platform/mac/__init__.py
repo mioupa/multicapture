@@ -30,7 +30,7 @@ MUTE_VIA_CAPTURE = True
 SEQUENTIAL_AUDIO_DELAY = 0.0
 # Freshly started browsers drop video frames for ~30 s (Spotlight, fonts, model loading, ...).
 # ".noindex" keeps Spotlight from indexing the cloned profiles.
-BROWSER_SETTLE_SECONDS = 30
+BROWSER_SETTLE_SECONDS = float(os.environ.get("MULTICAPTURE_SETTLE_SECONDS", 30))
 WORK_DIR_NAME = "work.noindex"
 DISPLAY_ALWAYS_ON = True
 FFMPEG_NAME = "ffmpeg"

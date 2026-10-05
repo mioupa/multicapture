@@ -282,7 +282,8 @@ class SplitJob:
                 except Exception:
                     pass
             time.sleep(1.0)
-            shutil.rmtree(self._job_dir, ignore_errors=True)
+            if not os.environ.get("MULTICAPTURE_KEEP_WORK"):   # keep segment files for diagnosis
+                shutil.rmtree(self._job_dir, ignore_errors=True)
 
     def _session_failure_hint(self, failed):
         """When an encoder session limit made segments fail, remember the cap and tell the user the safe count."""

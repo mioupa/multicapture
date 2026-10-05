@@ -1,3 +1,4 @@
+import math
 import os
 import shutil
 import subprocess
@@ -138,18 +139,20 @@ def _sad(a, b):
 
 
 def find_join(ffmpeg, part_a, duration_a, part_b, at_b, fps, nominal_a, window=1.2):
-    head = decode_gray(ffmpeg, part_b, at_b, 1)
+    # Seek half a frame before the wanted frame: -ss keeps frames at or after the seek point, so
+    # seeking exactly onto a frame time (or rounding the start) can be off by one frame.
+    head = decode_gray(ffmpeg, part_b, (round(at_b * fps) - 0.5) / fps, 1)
     if not head:
         return None
-    start = max(0.0, duration_a - window)
-    tail = decode_gray(ffmpeg, part_a, start, None)
+    first = max(0, math.ceil(max(0.0, duration_a - window) * fps - 1e-6))
+    tail = decode_gray(ffmpeg, part_a, (first - 0.5) / fps, None)
     if not tail:
         return None
-    first = round(start * fps)
     scores = [_sad(head[0], frame) for frame in tail]
     best = min(scores)
-    spread = max(scores) - best
-    near = [i for i, s in enumerate(scores) if s <= best + max(spread * 0.05, len(head[0]) * 0.5)]
+    # Frames as good as the best match (static content) are candidates; the tolerance is relative to the
+    # best match, not to the spread, so a flash or scene cut in the window cannot pull in a neighbour.
+    near = [i for i, s in enumerate(scores) if s <= best + max(best * 0.5, len(head[0]) * 0.5)]
     pick = min(near, key=lambda i: abs((first + i) / fps - nominal_a))
     return (first + pick) / fps
 

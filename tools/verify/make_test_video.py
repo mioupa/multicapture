@@ -25,8 +25,15 @@ NBITS = 20
 def build_filter(w, h, fps):
     band = round(96 * h / 1080)
     cw = w // CELLS
-    f = ["format=yuv420p",
-         f"drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='between(mod(n,{fps}),0,1)'"]
+    # Two large boxes move every frame, so neighbouring frames differ clearly even in the small
+    # thumbnails the app's join search compares (like real video), not only in the barcode bands.
+    bw, bh = round(w / 4), round(h * 0.4)
+    sq = round(h * 0.28)
+    moving = (f"color=c=0x6080ff:s={bw}x{bh}:r={fps}[b1];color=c=0xff8040:s={sq}x{sq}:r={fps}[b2];"
+              f"[in]format=yuv420p[v0];"
+              f"[v0][b1]overlay=x='mod(n*{round(w / 31)},W-w)':y={round(h * 0.2)}:shortest=1[v1];"
+              f"[v1][b2]overlay=x={round(w * 0.7)}:y='{band}+mod(n*{round(h / 29)},H-2*{band}-h)':shortest=1[v2];[v2]")
+    f = [f"drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='between(mod(n,{fps}),0,1)'"]
     for y in (0, h - band):
         f.append(f"drawbox=x=0:y={y}:w={cw * CELLS}:h={band}:color=black:t=fill")
         white = lambda i, y=y: f"drawbox=x={i * cw}:y={y}:w={cw}:h={band}:color=white:t=fill"
@@ -36,7 +43,7 @@ def build_filter(w, h, fps):
             f.append(white(1 + k) + f":enable='eq(mod(floor(n/{2 ** k}),2),1)'")
         par = "+".join(f"mod(floor(n/{2 ** k}),2)" for k in range(NBITS))
         f.append(white(21) + f":enable='eq(mod({par},2),1)'")
-    return ",".join(f)
+    return moving + ",".join(f) + "[out]"
 
 
 def main():
