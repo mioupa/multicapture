@@ -236,6 +236,14 @@ class HelperSession:
     def _on_event(self, ev):
         kind = ev.get("ev")
         self.events.append(ev)
+        log = self._log
+        if log and kind not in ("windows", "permission"):
+            # per-second stats and stalls end up next to the helper's own stderr for diagnosis
+            try:
+                log.write(b"[event] " + json.dumps(ev, ensure_ascii=False).encode() + b"\n")
+                log.flush()
+            except (OSError, ValueError):
+                pass
         with self._state_lock:
             if kind == "ready":
                 self.ready_event = ev

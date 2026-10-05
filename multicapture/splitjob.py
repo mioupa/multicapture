@@ -224,6 +224,12 @@ class SplitJob:
                 extra[1].close()
                 extra[0].close(timeout=5)
             prepared = prepared[:n]
+            settle_until = time.monotonic() + osp.BROWSER_SETTLE_SECONDS
+            while time.monotonic() < settle_until:
+                if self.cancel_event.is_set():
+                    raise RuntimeError("中止しました")
+                self._status(f"ブラウザの動作が落ち着くのを待っています（あと{int(settle_until - time.monotonic()) + 1}秒）")
+                time.sleep(0.5)
             self._publish()
             self._emit("started", {"duration": self.duration, "segments": n, "title": title})
             self._status(f"動画の長さ {fmt_time(self.duration)} を {n} 分割して録画しています")

@@ -101,7 +101,7 @@ def login_profile_dir():
 
 
 def work_dir():
-    path = os.path.join(data_dir(), "work")
+    path = os.path.join(data_dir(), osp.WORK_DIR_NAME)
     os.makedirs(path, exist_ok=True)
     return path
 

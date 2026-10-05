@@ -21,6 +21,8 @@ Module-level names every implementation exports:
     AudioPipe            see AudioPipe below
     MUTE_VIA_CAPTURE     True when muting is done by open_audio_capture(mute=True) (mac)
     SEQUENTIAL_AUDIO_DELAY  seconds added to audio timestamps in split (sequential) recordings
+    BROWSER_SETTLE_SECONDS  wait after the split browsers are ready, before recording starts
+    WORK_DIR_NAME        name of the work folder (cloned profiles) inside the data folder
     SpeakerMute          see SpeakerMute below
     restore_speakers_if_needed(state_path)
 

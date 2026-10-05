@@ -15,7 +15,7 @@ import time
 __all__ = [
     "NAME", "clock", "thread_init", "popen_kwargs",
     "BROWSER_LABELS", "DEFAULT_BROWSER", "available_browsers", "BrowserWindow",
-    "open_window_capture", "open_audio_capture", "AudioPipe", "MUTE_VIA_CAPTURE", "SEQUENTIAL_AUDIO_DELAY", "SpeakerMute",
+    "open_window_capture", "open_audio_capture", "AudioPipe", "MUTE_VIA_CAPTURE", "SEQUENTIAL_AUDIO_DELAY", "BROWSER_SETTLE_SECONDS", "WORK_DIR_NAME", "SpeakerMute",
     "restore_speakers_if_needed", "KeepAwake", "DISPLAY_ALWAYS_ON",
     "default_data_dir", "default_output_dir", "FFMPEG_NAME", "ffmpeg_candidates", "open_folder",
     "physical_memory_bytes", "TK_THEME", "UI_FONT", "set_dpi_awareness", "primary_screen_size",
@@ -28,6 +28,10 @@ DEFAULT_BROWSER = "chrome"
 MUTE_VIA_CAPTURE = True
 # The helper already shifts tap timestamps by the output latency (PROTOCOL.md).
 SEQUENTIAL_AUDIO_DELAY = 0.0
+# Freshly started browsers drop video frames for ~30 s (Spotlight, fonts, model loading, ...).
+# ".noindex" keeps Spotlight from indexing the cloned profiles.
+BROWSER_SETTLE_SECONDS = 30
+WORK_DIR_NAME = "work.noindex"
 DISPLAY_ALWAYS_ON = True
 FFMPEG_NAME = "ffmpeg"
 TK_THEME = "aqua"
