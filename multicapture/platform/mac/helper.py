@@ -40,6 +40,8 @@ def helper_candidates():
     elif getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
         contents = os.path.dirname(exe_dir)
+        # the helper bundle (see build_mac.sh); a bare executable cannot start ScreenCaptureKit streams
+        found.append(([os.path.join(contents, "Helpers", "MultiCapture Capture.app", "Contents", "MacOS", "mc-capture")], "bundle"))
         dirs = [exe_dir, os.path.join(contents, "Frameworks"), os.path.join(contents, "Resources")]
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:

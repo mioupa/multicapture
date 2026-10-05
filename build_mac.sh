@@ -120,7 +120,7 @@ rm -rf "$PKG" "$BUILD/work-mac"
 mkdir -p "$PKG"
 "$VENV/bin/python" -m PyInstaller --noconfirm --clean --windowed --onedir \
   --name "$NAME" --osx-bundle-identifier "$BUNDLE_ID" --target-architecture arm64 \
-  --add-binary "$HELPER:." --add-binary "$FFMPEG_BIN:." \
+  --add-binary "$FFMPEG_BIN:." \
   --paths "$ROOT" \
   --distpath "$PKG" --workpath "$BUILD/work-mac" --specpath "$BUILD" \
   "$ROOT/MultiCapture.pyw"
@@ -136,10 +136,26 @@ pbset LSMinimumSystemVersion "$MIN_OS"
 pbset NSAudioCaptureUsageDescription "ブラウザの音声を録音するために使います。"
 pbset NSHighResolutionCapable true bool
 
+# 補助プログラムは、自分の Info.plist を持つ小さなバンドルとして Contents/Helpers に置く。
+# 単体の実行ファイルのままだと、ScreenCaptureKit の開始時に replayd との接続が切られる（-3805）。
+HELPER_APP="$APP/Contents/Helpers/$NAME Capture.app"
+mkdir -p "$HELPER_APP/Contents/MacOS"
+cp "$HELPER" "$HELPER_APP/Contents/MacOS/mc-capture"
+HPL="$HELPER_APP/Contents/Info.plist"
+plutil -create xml1 "$HPL"
+plutil -insert CFBundleIdentifier -string "$BUNDLE_ID.capture" "$HPL"
+plutil -insert CFBundleName -string "$NAME Capture" "$HPL"
+plutil -insert CFBundleExecutable -string mc-capture "$HPL"
+plutil -insert CFBundlePackageType -string APPL "$HPL"
+plutil -insert CFBundleShortVersionString -string "$VERSION" "$HPL"
+plutil -insert CFBundleVersion -string "$VERSION" "$HPL"
+plutil -insert LSMinimumSystemVersion -string "$MIN_OS" "$HPL"
+plutil -insert LSUIElement -bool true "$HPL"
+plutil -insert NSAudioCaptureUsageDescription -string "ブラウザの音声を録音するために使います。" "$HPL"
+
 # 補助プログラムと FFmpeg が、アプリが探す場所に入っているか
-for f in mc-capture ffmpeg; do
-  [ -x "$APP/Contents/Frameworks/$f" ] || die "$f が Contents/Frameworks にありません（helper.py / ffmpeg_candidates の探索先と合わせてください）。"
-done
+[ -x "$HELPER_APP/Contents/MacOS/mc-capture" ] || die "補助プログラムが $HELPER_APP にありません（helper.py の探索先と合わせてください）。"
+[ -x "$APP/Contents/Frameworks/ffmpeg" ] || die "ffmpeg が Contents/Frameworks にありません（ffmpeg_candidates の探索先と合わせてください）。"
 
 # ---- 4. 署名（内側から順に。全部同じ ID） ----
 if [ "$SELF_SIGN" = 1 ]; then
@@ -160,12 +176,13 @@ MAIN_EXE="$APP/Contents/MacOS/$NAME"
 while IFS= read -r f; do
   [ "$f" = "$MAIN_EXE" ] && continue    # メイン実行ファイルはアプリの署名と一緒に最後にやる
   case "$f" in
-    */Frameworks/mc-capture) "${CS[@]}" -i "$BUNDLE_ID.capture" "$f";;
+    */Helpers/*.app/Contents/MacOS/mc-capture) ;;   # バンドルごと下で署名する
     */Frameworks/ffmpeg)     "${CS[@]}" -i "$BUNDLE_ID.ffmpeg" "$f";;
     *) "${CS[@]}" "$f";;
   esac
 done < "$MACHO"
 rm -f "$MACHO"
+"${CS[@]}" -i "$BUNDLE_ID.capture" "$HELPER_APP"
 find "$APP" -type d -name '*.framework' -print 2>/dev/null \
   | awk '{ n=gsub("/","/"); print n "\t" $0 }' | sort -rn | cut -f2- | while IFS= read -r d; do "${CS[@]}" "$d"; done
 if [ -n "$APP_REQ" ]; then
@@ -187,7 +204,7 @@ cp "$ROOT/README.md" "$STAGE/"
   echo "FFmpeg is built without any GPL or non-free components, as a static executable."
   echo "Source: $FFMPEG_URL"
   echo "SHA-256: $FFMPEG_SHA256"
-  echo "Configuration: $("$FFMPEG_BIN" -hide_banner -version | grep -i '^configuration:' | sed 's/^configuration: *//')"
+  echo "Configuration: $("$FFMPEG_BIN" -hide_banner -version | grep -i '^configuration:' | sed -e 's/^configuration: *//' -e 's/--prefix=[^ ]* *//')"
   echo "FFmpeg is a trademark of Fabrice Bellard. https://ffmpeg.org/legal.html"
 } > "$STAGE/FFMPEG_NOTICE.txt"
 [ -z "$FFMPEG_LICENSE" ] || cp "$FFMPEG_LICENSE" "$STAGE/FFMPEG_COPYING.LGPLv2.1.txt"

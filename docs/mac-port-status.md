@@ -12,7 +12,7 @@
 | Phase 1（共通化と同時録画数の自動決定） | 完了。Windows の実機確認済み（ユーザー） |
 | Phase 2（mac 版「動画を高速録画」） | 実装済み。M4 で 5分の動画を2本・6本で検証した。2時間の受け入れ試験は未実施 |
 | Phase 3（mac 版「ページを同時録画」） | 実装済み。2ページ・2分で保存できることを確認した。4ページ・30分の試験は未実施 |
-| Phase 4（配布物と README） | `build_mac.sh`、README の mac 節。macOS 15 での確認は未実施（手元に macOS 15 の Mac がないため） |
+| Phase 4（配布物と README） | `build_mac.sh`、README の mac 節。隔離属性付きの ZIP から展開した .app で、Gatekeeper の「このまま開く」、許可、録画まで確認した（macOS 27）。macOS 15 での確認は未実施（手元に macOS 15 の Mac がないため） |
 
 ## 2. 要件定義書と違う点
 
@@ -26,6 +26,7 @@
 | 音声のタイムスタンプ | mHostTime | mHostTime ＋出力機器の遅延 | タップの音は鳴る前のもの。Chrome は鳴る時刻に映像を合わせるため |
 | SCK のコマ | complete のコマを使う | 直前と画素がまったく同じコマは捨てる | SCK は中身の変わらないコマも渡す。区間録画は届いたコマを順に書くので、WGC と同じ「変わったときだけ」にそろえた |
 | VideoToolbox の画質 | 実装時に決める | `-q:v 55`（x264 の CRF 23 と同等の SSIM、ビットレート 1.2〜1.3倍） | `tools/verify/vt_quality.py` |
+| 補助プログラムの同梱 | （指定なし） | `Contents/Helpers/MultiCapture Capture.app` として、自分の Info.plist を持つバンドルにして同梱する | 単体の実行ファイルのままだと、ScreenCaptureKit の開始時に replayd との接続が切られる（-3805）。許可はアプリ本体のものを引き継ぐ |
 | FFmpeg の同梱 | arm64 の静的ビルド、GPL | 公式ソースから外部ライブラリなしでビルドした LGPL の静的ビルド | 第三者のバイナリに頼らずに済む。x264 は含まない（VideoToolbox を使う） |
 | バージョン | — | 2.0.0 | ユーザー決定 |
 | バンドル ID | — | `io.github.satoa-may5.multicapture` | ユーザー決定（今後変えない） |
