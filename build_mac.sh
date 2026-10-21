@@ -46,9 +46,9 @@ for c in curl tar make ditto codesign shasum; do
   command -v "$c" >/dev/null || die "$c が見つかりません。"
 done
 PYTHON="${PYTHON:-python3}"
-command -v "$PYTHON" >/dev/null || die "python3 が見つかりません（brew install python@3.14 python-tk@3.14）。"
+command -v "$PYTHON" >/dev/null || die "python3 が見つかりません（brew install python python-tk）。"
 "$PYTHON" -c 'import tkinter' 2>/dev/null \
-  || die "この Python は tkinter を使えません（brew install python-tk@3.14）: $PYTHON"
+  || die "この Python は tkinter を使えません（brew install python-tk）: $PYTHON"
 if [ -n "$FFMPEG_BIN" ]; then [ -x "$FFMPEG_BIN" ] || die "--ffmpeg に指定したファイルが実行できません: $FFMPEG_BIN"; fi
 if [ -n "${MC_SIGN_KEYCHAIN:-}" ] || [ -n "${MC_SIGN_KEYCHAIN_PASS:-}" ] || [ -n "${MC_SIGN_HASH:-}" ]; then
   : "${MC_SIGN_KEYCHAIN:?MC_SIGN_KEYCHAIN が未設定}" "${MC_SIGN_KEYCHAIN_PASS:?MC_SIGN_KEYCHAIN_PASS が未設定}" "${MC_SIGN_HASH:?MC_SIGN_HASH が未設定}"
